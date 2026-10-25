@@ -15,32 +15,41 @@ const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', 
 let gmapsLoaded = false;
 let gmapsLoading = false;
 const gmapsCallbacks = [];
+
+function finishGmapsLoad() {
+  if (gmapsLoaded) return;
+  gmapsLoaded = true;
+  gmapsCallbacks.forEach((f) => f());
+  gmapsCallbacks.length = 0;
+}
+
 function loadGmapsApi(cb) {
-  if (gmapsLoaded) { cb(); return; }
+  if (gmapsLoaded || (typeof window !== 'undefined' && window.google?.maps)) {
+    gmapsLoaded = true;
+    cb();
+    return;
+  }
   gmapsCallbacks.push(cb);
   if (gmapsLoading) return;
   gmapsLoading = true;
   if (!GMAPS_KEY) {
     // No key available — resolve immediately (will fallback to OSM)
-    gmapsLoaded = true;
-    gmapsCallbacks.forEach((f) => f());
-    gmapsCallbacks.length = 0;
+    finishGmapsLoad();
     return;
   }
+  window.__initGmapsApi = finishGmapsLoad;
   const s = document.createElement('script');
-  s.src = `https://maps.googleapis.com/maps/api/js?key=${GMAPS_KEY}&libraries=places`;
+  s.src = `https://maps.googleapis.com/maps/api/js?key=${GMAPS_KEY}&libraries=places&loading=async&callback=__initGmapsApi`;
   s.async = true;
   s.defer = true;
   s.onload = () => {
-    gmapsLoaded = true;
-    gmapsCallbacks.forEach((f) => f());
-    gmapsCallbacks.length = 0;
+    if (window.google?.maps) {
+      finishGmapsLoad();
+    }
   };
   s.onerror = () => {
     // Fallback gracefully
-    gmapsLoaded = true;
-    gmapsCallbacks.forEach((f) => f());
-    gmapsCallbacks.length = 0;
+    finishGmapsLoad();
   };
   document.head.appendChild(s);
 }
