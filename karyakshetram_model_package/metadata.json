@@ -1,0 +1,21 @@
+{
+  "project": "KARYAKSHETRAM",
+  "target": "annual_revenue",
+  "features": [
+    "category_key",
+    "population_within_1km",
+    "population_within_2km",
+    "population_density",
+    "data_coverage",
+    "competitors_within_500m_est",
+    "competitors_within_1km",
+    "competitors_within_2km"
+  ],
+  "training_rows": 357,
+  "model_type": "RandomForestRegressor",
+  "validation": "5-fold GroupKFold using H3 resolution-6 parent groups",
+  "spatial_cv_mae_rs": 1722144,
+  "spatial_cv_rmse_rs": 2224563,
+  "spatial_cv_r2": 0.1392,
+  "status": "experimental_not_production_validated"
+}

@@ -1,0 +1,28 @@
+# Local fallback stack (PRD FR-14): MongoDB + API + web.  Usage:
+#   docker compose up -d --build
+#   docker compose exec server node src/scripts/seed.js     # first run only
+#   open http://localhost:8080   (demo@karyakshetram.in / Demo@1234)
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes: [mongo-data:/data/db]
+    ports: ["27017:27017"]
+  server:
+    build: ./server
+    restart: unless-stopped
+    environment:
+      MONGO_URI: mongodb://mongo:27017/karyakshetram
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      CORS_ORIGINS: http://localhost:8080
+      ML_SERVICE_URL: ${ML_SERVICE_URL:-}
+      ML_INTERNAL_KEY: ${ML_INTERNAL_KEY:-}
+    depends_on: [mongo]
+    ports: ["4000:4000"]
+  client:
+    build: ./client
+    restart: unless-stopped
+    depends_on: [server]
+    ports: ["8080:80"]
+volumes:
+  mongo-data:

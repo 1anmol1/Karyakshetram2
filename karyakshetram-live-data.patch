@@ -1,0 +1,2026 @@
+From 36c3f705d240e7d0be299de04b2018ed7b45c66c Mon Sep 17 00:00:00 2001
+From: Ashitosh <ashitoshkumbhar05@gmail.com>
+Date: Sun, 25 Oct 2026 07:19:00 +0000
+Subject: [PATCH 1/2] feat: live competitor data (OSM Overpass + registries)
+ for 7 categories, what-if closures, Trust Center feasibility
+
+- Overpass sync every LIVE_REFRESH_HOURS for grocery, pharmacy, qsr, cafe, fuel, bank, ev
+- Registry merge for offline businesses; cancelled licences / vanished outlets close competitors
+- What-if 'competitor doesn't exist' recomputes hexagons, scores and recommendations
+- Trust Center: big feasibility % per live category with breakdown and sync status
+- Python ML: /ml/reload, ignore closed POIs, competitor-density drift guard
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A8Nu9DmWHXbSg49PW6bDzz
+---
+ backend/app/main.py                       |   7 +
+ backend/app/model_engine.py               |  20 ++-
+ client/src/components/CompetitorModal.jsx |  25 ++-
+ client/src/components/LiveFeasibility.jsx | 106 ++++++++++++
+ client/src/pages/Trust.jsx                |   3 +
+ docs/LIVE_DATA.md                         |  43 +++++
+ render.yaml                               |   4 +
+ server/.env.example                       |   6 +
+ server/data/registry/README.md            |  16 ++
+ server/src/app.js                         |   2 +
+ server/src/data/liveSources.js            |  92 ++++++++++
+ server/src/index.js                       |   2 +
+ server/src/ml/placeholder/state.js        |   2 +-
+ server/src/models/index.js                |  14 ++
+ server/src/routes/core.js                 |   5 +-
+ server/src/routes/live.js                 |  69 ++++++++
+ server/src/scripts/seed.js                |   4 +-
+ server/src/services/cache.js              |   1 +
+ server/src/services/liveData.js           | 196 ++++++++++++++++++++++
+ 19 files changed, 612 insertions(+), 5 deletions(-)
+ create mode 100644 client/src/components/LiveFeasibility.jsx
+ create mode 100644 docs/LIVE_DATA.md
+ create mode 100644 server/data/registry/README.md
+ create mode 100644 server/src/data/liveSources.js
+ create mode 100644 server/src/routes/live.js
+ create mode 100644 server/src/services/liveData.js
+
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 5bd45bd..2020a46 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -100,6 +100,13 @@ def health():
+         "loadedAt": engine.loaded_at,
+     }
+ 
++@app.post("/ml/reload")
++def reload_state(x_internal_key: Optional[str] = Header(None)):
++    """Called by the Node API after a live competitor sync or a what-if closure."""
++    verify_key(x_internal_key)
++    engine.load()
++    return {"ok": True, "loadedAt": engine.loaded_at}
++
+ @app.get("/meta")
+ def meta():
+     return {
+diff --git a/backend/app/model_engine.py b/backend/app/model_engine.py
+index 6e8be3c..a790621 100644
+--- a/backend/app/model_engine.py
++++ b/backend/app/model_engine.py
+@@ -72,7 +72,7 @@ class ModelEngine:
+         self.cells_by_id = {c['_id']: c for c in self.cells}
+ 
+         # 2. POIs / Competitors
+-        raw_pois = list(db['competitors'].find({}))
++        raw_pois = list(db['competitors'].find({'status': {'$ne': 'closed'}}))
+         self.pois_by_category = {}
+         for p in raw_pois:
+             cat = p.get('category', 'grocery')
+@@ -184,6 +184,17 @@ class ModelEngine:
+         self.catchment_cache[category] = res
+         return res
+ 
++    SIM_POI_COUNT = {'grocery': 70, 'pharmacy': 90, 'cafe': 70, 'qsr': 60, 'restaurant': 70, 'bakery': 50, 'mobile': 60, 'salon': 55,
++                     'fashion': 45, 'footwear': 40, 'jewellery': 35, 'convenience': 60, 'mall': 8, 'warehouse': 10, 'auto': 22,
++                     'fuel': 28, 'ev': 18, 'coworking': 20}
++
++    def competitor_scale(self, category):
++        if os.environ.get('LIVE_DRIFT_GUARD', 'on') == 'off':
++            return 1.0
++        live_n = len(self.pois_by_category.get(category, []))
++        sim_n = self.SIM_POI_COUNT.get(category, 30)
++        return min(1.0, sim_n / live_n) if live_n > sim_n * 1.5 else 1.0
++
+     def compute_features(self, cell, category):
+         cache_key = f"{cell['_id']}:{category}"
+         if cache_key in self.feature_cache:
+@@ -217,6 +228,13 @@ class ModelEngine:
+             if d <= 2.0:
+                 c_2km += 1
+ 
++        # Drift guard: the RF was trained on the simulated competitor layer (SIM_POI_COUNT per category).
++        # Real OSM/registry layers are much denser, which would push counts outside the training range
++        # (a forest cannot extrapolate). Rescale to the training density so the model sees *relative*
++        # competition intensity. Remove once the model is retrained on live-data features.
++        scale = self.competitor_scale(category)
++        c_500m, c_1km, c_2km = c_500m * scale, c_1km * scale, c_2km * scale
++
+         f_dict = {
+             'category_key': category,
+             'population_within_1km': float(pop_1km),
+diff --git a/client/src/components/CompetitorModal.jsx b/client/src/components/CompetitorModal.jsx
+index e6c370d..4e0a5bc 100644
+--- a/client/src/components/CompetitorModal.jsx
++++ b/client/src/components/CompetitorModal.jsx
+@@ -2,12 +2,23 @@ import { useEffect, useState } from 'react';
+ import { useNavigate } from 'react-router-dom';
+ import { api } from '../lib/api.js';
+ import { inr, km, n } from '../lib/format.js';
+-import { useApp } from '../lib/state.jsx';
++import { useApp, useAuth } from '../lib/state.jsx';
+ import { Modal, Icon, Kv, Tier, Conf, Banner, Skel } from './ui.jsx';
+ 
+ export default function CompetitorAnalysisModal({ open, onClose, shop, activeCategory }) {
+   const nav = useNavigate();
+   const { categories, setCategory } = useApp();
++  const { user } = useAuth();
++  const [whatIf, setWhatIf] = useState(null);
++  const markGone = async () => {
++    if (!shop?.id) return;
++    setWhatIf('busy');
++    try {
++      await api(`/live/competitors/${shop.id}/status`, { method: 'POST', body: { status: 'closed', reason: 'WHAT_IF' } });
++      setWhatIf('done');
++      setTimeout(() => window.location.reload(), 900); // every hexagon, score and recommendation recomputes server-side
++    } catch (e) { setWhatIf(e.message || 'Failed'); }
++  };
+   const [data, setData] = useState(null);
+   const [loading, setLoading] = useState(false);
+ 
+@@ -185,6 +196,18 @@ export default function CompetitorAnalysisModal({ open, onClose, shop, activeCat
+                   Test Cannibalisation
+                 </button>
+               )}
++              {user && shop.relation !== 'Your store' && (
++                <button type="button" className="btn out sm" disabled={whatIf === 'busy' || whatIf === 'done'} onClick={markGone} title="What-if: remove this competitor and recompute every score">
++                  <Icon n="store-3-line" s={14} />
++                  {whatIf === 'done' ? 'Removed · recomputing…' : whatIf === 'busy' ? 'Removing…' : 'What if this competitor doesn\u2019t exist?'}
++                </button>
++              )}
++              {shop.source && shop.source !== 'own' && (
++                <span className={`tag ${shop.source === 'simulated' ? 'warn' : 'ok'}`} style={{ fontSize: 11 }}>
++                  {shop.source === 'simulated' ? 'Simulated record' : shop.source === 'registry' ? 'Registry (offline business)' : shop.source === 'osm+registry' ? 'Live · map + registry' : 'Live · OpenStreetMap'}
++                </span>
++              )}
++              {whatIf && !['busy', 'done'].includes(whatIf) && <span className="s12" style={{ color: 'var(--bad, #c33)' }}>{whatIf}</span>}
+               <button type="button" className="btn ghost sm" onClick={onClose} style={{ marginLeft: 'auto' }}>
+                 Close
+               </button>
+diff --git a/client/src/components/LiveFeasibility.jsx b/client/src/components/LiveFeasibility.jsx
+new file mode 100644
+index 0000000..75158a1
+--- /dev/null
++++ b/client/src/components/LiveFeasibility.jsx
+@@ -0,0 +1,106 @@
++// Trust Center: real-time data feasibility per live category (big %), source mix, last sync, closures.
++import { useState } from 'react';
++import { useApi, useAuth } from '../lib/state.jsx';
++import { api } from '../lib/api.js';
++import { Icon, Skel } from './ui.jsx';
++
++const PART_LABEL = { mapCoverage: 'Map coverage', registry: 'Registry quality', freshness: 'Freshness', brandSignal: 'Brand signal' };
++const ago = (d) => {
++  if (!d) return 'never';
++  const m = Math.round((Date.now() - new Date(d)) / 60000);
++  return m < 60 ? `${m} min ago` : m < 1440 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} d ago`;
++};
++const tone = (p) => (p >= 80 ? 'var(--ok)' : p >= 65 ? 'var(--accent)' : 'var(--warn, #c98a00)');
++
++export default function LiveFeasibility({ selected, onSelect }) {
++  const { user } = useAuth();
++  const st = useApi('/live/status', []);
++  const closed = useApi(`/live/competitors/closed?category=${selected}`, [selected]);
++  const restore = async (id) => {
++    setBusy(id);
++    try { await api(`/live/competitors/${id}/status`, { method: 'POST', body: { status: 'open', reason: 'WHAT_IF' } }); closed.refetch(); st.refetch(); setMsg('Restored · scores recomputed'); } catch (e) { setMsg(e.message); } finally { setBusy(null); }
++  };
++  const [busy, setBusy] = useState(null);
++  const [msg, setMsg] = useState(null);
++  const cats = st.data?.categories || [];
++  const cur = cats.find((c) => c.key === selected);
++
++  const refresh = async (key) => {
++    setBusy(key); setMsg(null);
++    try {
++      const { results } = await api(`/live/refresh?category=${key}`, { method: 'POST', timeout: 120000 });
++      const r = results[0];
++      setMsg(r.ok === false ? `Live fetch failed: ${r.error}. Previous data kept.` : `Synced: ${r.open} open · +${r.added} new · ${r.closed} closed`);
++      st.refetch();
++    } catch (e) { setMsg(e.message); } finally { setBusy(null); }
++  };
++
++  return (
++    <div className="card pad20 col g16 shadow" style={{ background: 'var(--bg)' }}>
++      <div className="row sb ac wrap g8">
++        <div className="col g4">
++          <div className="h4 row g6 ac"><Icon n="broadcast-line" s={18} c="var(--accent)" /> Real-time data feasibility</div>
++          <span className="s13 muted">Share of the real market we can see with free, refreshable data (OpenStreetMap + official registries). Competitors that close drop out automatically and every score recomputes.</span>
++        </div>
++        <span className="tag info">{cats.length} live categories · others simulated</span>
++      </div>
++
++      {!st.data ? <Skel h={150} /> : (
++        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 12 }}>
++          {cats.map((c) => (
++            <button key={c.key} type="button" onClick={() => onSelect?.(c.key)} className="card pad16 col g4"
++              style={{ textAlign: 'left', cursor: 'pointer', border: c.key === selected ? '2px solid var(--accent)' : '1px solid var(--line)', background: 'var(--surface, var(--bg))' }}>
++              <span className="s12 muted row g6 ac"><Icon n={c.icon} s={14} /> {c.name}</span>
++              <span className="num b" style={{ fontSize: 44, lineHeight: 1.05, color: tone(c.feasibility) }}>{c.feasibility}%</span>
++              <span className="s11 muted">{c.mode === 'live' ? `${c.counts.live} live outlets` : 'Awaiting first live sync'}</span>
++              <span className={`tag ${c.mode === 'live' ? 'ok' : 'warn'}`} style={{ alignSelf: 'flex-start', fontSize: 11 }}>{c.mode === 'live' ? `Live · ${ago(c.lastSuccessAt)}` : 'Simulated'}</span>
++            </button>
++          ))}
++        </div>
++      )}
++
++      {cur && (
++        <div className="row g16 as stack-md" style={{ borderTop: '1px solid var(--line)', paddingTop: 14 }}>
++          <div className="col g6 f1">
++            <b className="s14">{cur.name}: how {cur.feasibility}% is built</b>
++            {Object.entries(cur.parts).map(([k, v]) => (
++              <div key={k} className="row g8 ac s12">
++                <span style={{ width: 120 }} className="muted">{PART_LABEL[k]}</span>
++                <div className="f1" style={{ height: 8, background: 'var(--line)', borderRadius: 4 }}><div style={{ width: `${v}%`, height: 8, borderRadius: 4, background: tone(v) }} /></div>
++                <span className="num" style={{ width: 36, textAlign: 'right' }}>{v}%</span>
++              </div>
++            ))}
++            <span className="s11 faint">Feasibility = 40% map coverage + 25% registry + 20% freshness + 15% brand signal. Assessed estimate for Pune, not a measured census.</span>
++            <span className="s12 muted" style={{ lineHeight: 1.5 }}>{cur.note}</span>
++          </div>
++          <div className="col g6 f1 s13">
++            {cur.sources.map((s) => (
++              <div key={s.name} className="row g8 ac"><Icon n={s.kind === 'map' ? 'map-2-line' : 'file-list-3-line'} s={14} c="var(--accent)" /><span className="f1">{s.name}{s.field ? <span className="muted s12"> · {s.field}</span> : null}{s.refresh ? <span className="muted s12"> · {s.refresh}</span> : null}</span></div>
++            ))}
++            <div className="s12 muted">
++              On map: {(cur.counts.osm || 0) + (cur.counts['osm+registry'] || 0)} · Registry only (offline businesses): {cur.counts.registry || 0} · Verified in both: {cur.counts['osm+registry'] || 0}
++            </div>
++            <div className="s12 muted">
++              No longer exist: {Object.values(cur.counts.closed || {}).reduce((a, b) => a + b, 0)}
++              {Object.keys(cur.counts.closed || {}).length > 0 && ` (${Object.entries(cur.counts.closed).map(([k, v]) => `${k.replace(/_/g, ' ').toLowerCase()}: ${v}`).join(', ')})`}
++            </div>
++            {cur.lastSync && <div className="s12 muted">Last sync {ago(cur.lastSync.at)} · {cur.lastSync.ok ? `+${cur.lastSync.added || 0} new, ${cur.lastSync.closed || 0} closed, ${cur.lastSync.nameCoverage ?? '—'}% named` : `failed: ${cur.lastSync.error}`}</div>}
++            {user && <button type="button" className="btn out sm" style={{ alignSelf: 'flex-start' }} disabled={!!busy} onClick={() => refresh(cur.key)}><Icon n="refresh-line" s={14} /> {busy === cur.key ? 'Fetching live data…' : 'Refresh now'}</button>}
++            {msg && <span className="s12">{msg}</span>}
++            {(closed.data?.competitors || []).length > 0 && (
++              <div className="col g4" style={{ borderTop: '1px solid var(--line)', paddingTop: 8 }}>
++                <b className="s12">Removed competitors (what-if / closed)</b>
++                {closed.data.competitors.slice(0, 6).map((p) => (
++                  <div key={p.id} className="row g8 ac s12">
++                    <span className="f1">{p.name} <span className="muted">· {p.locality} · {(p.closedReason || '').replace(/_/g, ' ').toLowerCase()}</span></span>
++                    {user && ['WHAT_IF', 'USER_REPORTED'].includes(p.closedReason) && <button type="button" className="btn ghost sm" disabled={!!busy} onClick={() => restore(p.id)}>Restore</button>}
++                  </div>
++                ))}
++              </div>
++            )}
++          </div>
++        </div>
++      )}
++    </div>
++  );
++}
+diff --git a/client/src/pages/Trust.jsx b/client/src/pages/Trust.jsx
+index 5aae371..fe8a5df 100644
+--- a/client/src/pages/Trust.jsx
++++ b/client/src/pages/Trust.jsx
+@@ -3,6 +3,7 @@ import { useApi, useApp, useAuth } from '../lib/state.jsx';
+ import { inr } from '../lib/format.js';
+ import { Header, Footer, SystemBanners } from '../components/Layout.jsx';
+ import { Icon, Collapse, Skel, ErrorBox, Banner } from '../components/ui.jsx';
++import LiveFeasibility from '../components/LiveFeasibility.jsx';
+ 
+ export default function Trust() {
+   const { categories, category } = useApp();
+@@ -76,6 +77,8 @@ export default function Trust() {
+ 
+         {ev.error && <ErrorBox compact error={ev.error} onRetry={ev.refetch} />}
+ 
++        <LiveFeasibility selected={sel} onSelect={setSel} />
++
+         {/* Live production engine verification */}
+         <Banner tone="ok" icon="shield-check-line">
+           Live Production Engine: <b>RandomForestRegressor (300 trees) · {meta.data?.modelVersion || 'rf-300-v1.0.0'}</b> linked live via FastAPI ML microservice. Model evaluated via spatial block cross-validation (5 folds × 5 seeds) across all 30 commercial formats and 949 spatial hexagonal cells.
+diff --git a/docs/LIVE_DATA.md b/docs/LIVE_DATA.md
+new file mode 100644
+index 0000000..62ab8cd
+--- /dev/null
++++ b/docs/LIVE_DATA.md
+@@ -0,0 +1,43 @@
++# Live competitor data
++
++Seven categories now take their competitor layer from real data instead of the simulator:
++**grocery, pharmacy, qsr, cafe, fuel, bank, ev**. Every other category stays simulated and is labelled as such.
++
++| Category | Feasibility | Map source (OSM tags) | Registry for offline businesses |
++|---|---|---|---|
++| Fuel station | **89%** | `amenity=fuel` | PESO licences, IOCL/BPCL/HPCL outlet locators |
++| Banking & NBFC | **86%** | `amenity=bank` | RBI branch master / IFSC list |
++| QSR & fast food | **72%** | `amenity=fast_food` | FSSAI FoSCoS |
++| Pharmacy | **70%** | `amenity=pharmacy`, `shop=chemist` | FDA Maharashtra drug licences |
++| Cafe & coffee | **67%** | `amenity=cafe` | FSSAI FoSCoS |
++| Supermarket & grocery | **64%** | `shop=supermarket|grocery`, food wholesale | FSSAI FoSCoS |
++| EV charging | **62%** | `amenity=charging_station` | BEE list, Tata Power EZ / Statiq / ChargeZone |
++
++Feasibility = 40% map coverage + 25% registry quality + 20% freshness + 15% brand signal (assessed estimates, `server/src/data/liveSources.js`).
++
++## How it flows
++1. `startScheduler()` runs 15 s after boot, then every `LIVE_REFRESH_HOURS` (default 12). `LIVE_DATA=off` disables it.
++2. `syncCategory()` pulls Overpass, filters to the Pune & PCMC polygon, merges `server/data/registry/<key>.csv`, dedupes within 60 m.
++3. New outlets are added; map outlets missing from the latest pull become `closed / NOT_IN_LATEST_OSM`; cancelled licences become `closed / REGISTRY_CANCELLED`; outlets that come back are reopened.
++4. Simulated POIs of that category are deleted only after a successful live pull. A failed or empty pull keeps the old data.
++5. `reloadEverywhere()` reloads Node state, clears catchment + response caches and calls `POST /ml/reload` on the Python service, so hexagons, scores, recommendations, stress tests, portfolio and cannibalisation all recompute.
++
++## What-if: "this competitor doesn't exist"
++Competitor modal → **What if this competitor doesn't exist?** → `POST /api/live/competitors/:id/status {status:"closed"}`.
++The whole app recomputes. Restore from Trust Center → Real-time data feasibility → Removed competitors.
++What-if closures are global (shared by all users) and are never reopened by the scheduler.
++
++## API
++* `GET  /api/live/status[?category=]`: feasibility, source mix, last sync, closures
++* `POST /api/live/refresh[?category=]`: sync now (login)
++* `POST /api/live/registry/:category` `{rows:[{name,lat,lon,regNo,status}]}`: merge registry rows (login)
++* `POST /api/live/competitors/:id/status` `{status:"open"|"closed", reason}`: what-if (login)
++* `GET  /api/live/competitors/closed[?category=]`
++
++## Does the model need retraining?
++* **Placeholder engine (what Render runs today, no `ML_SERVICE_URL`)**: no. It scores competition relative to the city median (`compRef`), so it adapts to real counts automatically.
++* **Python RandomForest (`backend/`)**: trained on 357 rows of *simulated* competitor counts and *simulated* revenue (spatial-CV R² 0.14).
++  Real OSM layers are several times denser, so raw counts would fall outside the training range, where a forest just
++  returns its edge leaf. A **drift guard** (`competitor_scale`, `LIVE_DRIFT_GUARD=on`) rescales live counts to the training
++  density so the model sees relative intensity. Retraining on live features only makes sense once there is **real revenue**
++  (own-store uploads / outcomes); retraining on the simulator's revenue would just re-learn the simulator.
+diff --git a/render.yaml b/render.yaml
+index dce7727..c4d12f3 100644
+--- a/render.yaml
++++ b/render.yaml
+@@ -21,6 +21,10 @@ services:
+         value: "*"
+       - key: RATE_LIMIT_PER_MIN
+         value: 300
++      - key: LIVE_DATA
++        value: "on"
++      - key: LIVE_REFRESH_HOURS
++        value: 12
+       - key: MODEL_VERSION
+         value: rf-300-v1.0.0
+       - key: GEMINI_API_KEY
+diff --git a/server/.env.example b/server/.env.example
+index e12732c..3dafa31 100644
+--- a/server/.env.example
++++ b/server/.env.example
+@@ -16,3 +16,9 @@ MODEL_VERSION=rf-300-v1.0.0
+ # ---- Optional LLM narrative endpoint (template narratives are used when empty)
+ LLM_URL=
+ LLM_API_KEY=
++
++# ---- Live competitor data (OpenStreetMap Overpass + official registries)
++# Live categories: grocery, pharmacy, qsr, cafe, fuel, bank, ev. Others stay simulated.
++LIVE_DATA=on
++LIVE_REFRESH_HOURS=12
++# OVERPASS_URLS=https://overpass-api.de/api/interpreter,https://overpass.kumi.systems/api/interpreter
+diff --git a/server/data/registry/README.md b/server/data/registry/README.md
+new file mode 100644
+index 0000000..489dc29
+--- /dev/null
++++ b/server/data/registry/README.md
+@@ -0,0 +1,16 @@
++# Registry files (businesses that are not on the map)
++
++One CSV per live category: `grocery.csv`, `pharmacy.csv`, `qsr.csv`, `cafe.csv`, `fuel.csv`, `bank.csv`, `ev.csv`.
++
++```
++name,lat,lon,regNo,status
++Ganesh Medicals,18.6012,73.7811,MH-PZ1-20-12345,active
++Shree Medical,18.5501,73.8001,MH-PZ1-19-55555,cancelled
++```
++
++* `status` containing closed / cancelled / suspended / revoked / surrendered removes the matching map POI (within 60 m, same name).
++* A row with no matching map POI is added as an offline (registry-only) competitor.
++* Sources: FSSAI FoSCoS (food), FDA Maharashtra drug licences (pharmacy), RBI branch master / IFSC (bank),
++  PESO + oil-company outlet locators (fuel), BEE / operator lists (EV). Registries give addresses; geocode
++  to lat/lon before adding (pincode centroid is acceptable for a first pass).
++* Rows can also be POSTed: `POST /api/live/registry/:category` with `{ "rows": [ ... ] }` (logged-in user).
+diff --git a/server/src/app.js b/server/src/app.js
+index bbfd0dc..a4e0e5d 100644
+--- a/server/src/app.js
++++ b/server/src/app.js
+@@ -11,6 +11,7 @@ import profileRoutes from './routes/profile.js';
+ import storeRoutes from './routes/stores.js';
+ import coreRoutes from './routes/core.js';
+ import userRoutes from './routes/user.js';
++import liveRoutes from './routes/live.js';
+ 
+ import path from 'path';
+ import fs from 'fs';
+@@ -42,6 +43,7 @@ export function createApp() {
+   app.use('/api/auth', authLimiter, authRoutes);
+   app.use('/api/profile', profileRoutes);
+   app.use('/api/stores', storeRoutes);
++  app.use('/api/live', liveRoutes);
+   app.use('/api', userRoutes);
+   app.use('/api', coreRoutes);
+   app.use('/api', (req, res) => res.status(404).json({ error: { code: 'NOT_FOUND', message: `No route ${req.method} ${req.originalUrl}`, field: null } }));
+diff --git a/server/src/data/liveSources.js b/server/src/data/liveSources.js
+new file mode 100644
+index 0000000..d9db753
+--- /dev/null
++++ b/server/src/data/liveSources.js
+@@ -0,0 +1,92 @@
++/**
++ * LIVE DATA SOURCES — categories whose competitor layer comes from real, frequently-changing data
++ * instead of the seeded simulator.
++ *
++ *  1. OpenStreetMap via the Overpass API (free, no key, edited daily by the community).
++ *  2. Official registries for businesses that are NOT on the map (FSSAI, FDA drug licences, RBI branch
++ *     master, oil-company outlet lists, EV operator lists). Rows go in server/data/registry/<key>.csv
++ *     or are POSTed to /api/live/registry/:category. A registry row with status=closed/cancelled
++ *     removes the matching map POI.
++ *
++ * `feasibility` = how much of the real market for this category we can actually see with free,
++ * refreshable data in Pune today (0–100). It is an assessed estimate made up of four parts, shown in the
++ * Trust Center:
++ *   mapCoverage   – share of real outlets likely present on OSM in Pune
++ *   registry      – how usable the official registry is (open, geocodable, current)
++ *   freshness     – how quickly closures/openings show up
++ *   brandSignal   – share of POIs carrying a brand/name usable for brand-class sizing
++ * feasibility = round(0.4·mapCoverage + 0.25·registry + 0.2·freshness + 0.15·brandSignal)
++ * After each live sync the API also reports a measured `nameCoverage` (share of fetched POIs with a name).
++ */
++
++export const PUNE_BBOX = { s: 18.44, w: 73.715, n: 18.695, e: 73.995 };
++
++const HYPER = /d[\s-]?mart|reliance smart|star bazaar|spar|more megastore|big bazaar|metro cash/i;
++const SUPER = /reliance fresh|more|spencer|nature'?s basket|dorabjee|ratnadeep|smart point|fresh/i;
++
++export const LIVE = {
++  grocery: {
++    overpass: ['nwr["shop"="supermarket"]', 'nwr["shop"="grocery"]', 'nwr["shop"="wholesale"]["wholesale"~"food|grocery"]'],
++    registry: { name: 'FSSAI FoSCoS licence register', url: 'https://foscos.fssai.gov.in', field: 'FSSAI licence no.' },
++    parts: { mapCoverage: 55, registry: 70, freshness: 65, brandSignal: 75 },
++    note: 'Chains (D-Mart, Reliance, More, Star Bazaar) are well mapped; small kiranas are under-mapped, so the FSSAI register fills the gap.',
++    brandClass: (t) => (HYPER.test(t.name || t.brand || '') ? 'hypermarket' : SUPER.test(t.name || t.brand || '') || t.shop === 'supermarket' ? 'supermarket' : 'convenience'),
++    area: { hypermarket: 25000, supermarket: 6000, convenience: 1500 },
++  },
++  pharmacy: {
++    overpass: ['nwr["amenity"="pharmacy"]', 'nwr["shop"="chemist"]'],
++    registry: { name: 'FDA Maharashtra retail drug licences', url: 'https://fdamfg.maharashtra.gov.in', field: 'Drug licence no. (Form 20/21)' },
++    parts: { mapCoverage: 65, registry: 85, freshness: 70, brandSignal: 60 },
++    note: 'Every chemist must hold a drug licence, so the FDA list is close to a complete census; OSM covers chains (Apollo, MedPlus, Wellness Forever) well.',
++    brandClass: (t) => (/apollo|medplus|wellness forever|netmeds|truemeds|frank ross|noble/i.test(t.name || t.brand || '') ? 'chain' : 'independent'),
++    area: { chain: 800, independent: 400 },
++  },
++  qsr: {
++    overpass: ['nwr["amenity"="fast_food"]'],
++    registry: { name: 'FSSAI FoSCoS licence register', url: 'https://foscos.fssai.gov.in', field: 'FSSAI licence no.' },
++    parts: { mapCoverage: 70, registry: 70, freshness: 70, brandSignal: 85 },
++    note: 'Global and national QSR brands are almost fully mapped with brand tags; street-food stalls are not.',
++    brandClass: (t) => (t.brand || /mcdonald|kfc|domino|burger king|subway|pizza hut|wow! momo|taco bell/i.test(t.name || '') ? 'chain' : 'independent'),
++    area: { chain: 2200, independent: 900 },
++  },
++  cafe: {
++    overpass: ['nwr["amenity"="cafe"]'],
++    registry: { name: 'FSSAI FoSCoS licence register', url: 'https://foscos.fssai.gov.in', field: 'FSSAI licence no.' },
++    parts: { mapCoverage: 65, registry: 65, freshness: 65, brandSignal: 75 },
++    note: 'Starbucks, Third Wave, Blue Tokai, CCD are mapped; independent cafés open and close fast, so freshness matters.',
++    brandClass: (t) => (t.brand || /starbucks|third wave|blue tokai|cafe coffee day|ccd|costa|barista|tim hortons/i.test(t.name || '') ? 'chain' : 'independent'),
++    area: { chain: 1500, independent: 800 },
++  },
++  fuel: {
++    overpass: ['nwr["amenity"="fuel"]'],
++    registry: { name: 'PESO licences + OMC outlet locators (IOCL/BPCL/HPCL)', url: 'https://peso.gov.in', field: 'PESO licence / outlet code' },
++    parts: { mapCoverage: 90, registry: 85, freshness: 85, brandSignal: 95 },
++    note: 'Fuel stations are large, fixed and licensed; OSM coverage in Pune is near-complete and brands are tagged.',
++    brandClass: (t) => (/indian oil|iocl|bharat|bpcl|hindustan|hpcl|shell|nayara|jio-bp|reliance/i.test(t.brand || t.name || t.operator || '') ? 'omc' : 'other'),
++    area: { omc: 16000, other: 12000 },
++  },
++  bank: {
++    overpass: ['nwr["amenity"="bank"]'],
++    registry: { name: 'RBI Bank Branch master (DBIE / IFSC list)', url: 'https://www.rbi.org.in', field: 'IFSC code' },
++    parts: { mapCoverage: 80, registry: 95, freshness: 85, brandSignal: 90 },
++    note: 'RBI publishes every branch with IFSC; OSM has most branches with operator tags. Highest feasibility category.',
++    brandClass: (t) => (/state bank|sbi|hdfc|icici|axis|kotak|bank of maharashtra|bank of baroda|canara|union bank|pnb/i.test(t.name || t.brand || t.operator || '') ? 'major' : 'other'),
++    area: { major: 2000, other: 1200 },
++  },
++  ev: {
++    overpass: ['nwr["amenity"="charging_station"]'],
++    registry: { name: 'BEE public charger list + operator apps (Tata Power EZ, Statiq, ChargeZone)', url: 'https://beeindia.gov.in', field: 'Operator station ID' },
++    parts: { mapCoverage: 55, registry: 70, freshness: 60, brandSignal: 70 },
++    note: 'Fast-growing network: new chargers appear weekly and OSM lags; operator lists are the better live source.',
++    brandClass: (t) => (/dc|ccs|fast/i.test(JSON.stringify(t)) ? 'dc_fast' : 'ac'),
++    area: { dc_fast: 1500, ac: 600 },
++  },
++};
++
++export const feasibilityOf = (key) => {
++  const p = LIVE[key]?.parts; if (!p) return null;
++  return Math.round(0.4 * p.mapCoverage + 0.25 * p.registry + 0.2 * p.freshness + 0.15 * p.brandSignal);
++};
++
++export const isLive = (key) => !!LIVE[key];
++export const LIVE_KEYS = Object.keys(LIVE);
+diff --git a/server/src/index.js b/server/src/index.js
+index 83ba8cd..53b0fee 100644
+--- a/server/src/index.js
++++ b/server/src/index.js
+@@ -2,6 +2,7 @@ import mongoose from 'mongoose';
+ import { config } from './config/index.js';
+ import { createApp } from './app.js';
+ import { loadState } from './ml/placeholder/state.js';
++import { startScheduler } from './services/liveData.js';
+ 
+ async function start() {
+   await mongoose.connect(config.mongoUri, { serverSelectionTimeoutMS: 10000 });
+@@ -9,6 +10,7 @@ async function start() {
+   if (!s.cells) console.warn('No cells found. Run `npm run seed` first.');
+   console.log(`Loaded ${s.cells} cells, ${s.pois} POIs, ${s.profiles} category profiles · ML mode: ${config.mlServiceUrl ? 'remote ' + config.mlServiceUrl : 'placeholder'}`);
+   const app = createApp();
++  startScheduler(); // live OSM + registry competitor refresh (LIVE_REFRESH_HOURS, LIVE_DATA=off to disable)
+   app.listen(config.port, () => console.log(`Karyakshetram API on http://localhost:${config.port}`));
+ }
+ 
+diff --git a/server/src/ml/placeholder/state.js b/server/src/ml/placeholder/state.js
+index 49b0592..2ba541a 100644
+--- a/server/src/ml/placeholder/state.js
++++ b/server/src/ml/placeholder/state.js
+@@ -7,7 +7,7 @@ export const state = { cells: [], byId: new Map(), pois: new Map(), profiles: ne
+ 
+ export async function loadState() {
+   const [cells, pois, profiles, models] = await Promise.all([
+-    Cell.find({}).lean(), Poi.find({}).lean(), CategoryProfile.find({}).lean(), MlModel.find({ version: config.modelVersion }).lean(),
++    Cell.find({}).lean(), Poi.find({ status: { $ne: 'closed' } }).lean(), CategoryProfile.find({}).lean(), MlModel.find({ version: config.modelVersion }).lean(),
+   ]);
+   state.cells = cells.map((c) => ({ ...c, lat: c.centroid.coordinates[1], lon: c.centroid.coordinates[0] }));
+   state.byId = new Map(state.cells.map((c) => [c._id, c]));
+diff --git a/server/src/models/index.js b/server/src/models/index.js
+index d93781e..87a3b4e 100644
+--- a/server/src/models/index.js
++++ b/server/src/models/index.js
+@@ -74,6 +74,12 @@ export const Store = model('Store', StoreSchema);
+ const PoiSchema = new Schema({
+   osmId: String, name: String, category: { type: String, index: true }, brandClass: String, areaSqft: Number,
+   loc: Point, h3: { type: String, index: true }, locality: String,
++  // live data: where the record came from and whether it still exists
++  source: { type: String, enum: ['simulated', 'osm', 'registry', 'osm+registry'], default: 'simulated' },
++  brand: String, regNo: String,
++  status: { type: String, enum: ['open', 'closed'], default: 'open', index: true },
++  closedReason: String, // NOT_IN_LATEST_OSM | REGISTRY_CANCELLED | USER_REPORTED | WHAT_IF
++  firstSeen: Date, lastSeen: Date, statusChangedAt: Date,
+ }, { versionKey: false });
+ PoiSchema.index({ loc: '2dsphere' });
+ export const Poi = model('Poi', PoiSchema, 'competitors');
+@@ -125,3 +131,11 @@ export const SearchLog = model('SearchLog', new Schema({ user: { type: Schema.Ty
+ export const SiteVisit = model('SiteVisit', new Schema({
+   user: { type: Schema.Types.ObjectId, ref: 'User' }, author: String, cell: String, category: String, quotedRent: Number, footfall: Number, notes: String,
+ }, { timestamps: true }));
++
++// ---------- live data sync log (one row per category per sync)
++const LiveSyncSchema = new Schema({
++  category: { type: String, index: true }, ok: Boolean, error: String, durationMs: Number,
++  fetched: Number, osm: Number, registry: Number, both: Number, open: Number,
++  added: Number, closed: Number, reopened: Number, nameCoverage: Number, feasibility: Number,
++}, { timestamps: true, versionKey: false });
++export const LiveSync = model('LiveSync', LiveSyncSchema, 'live_syncs');
+diff --git a/server/src/routes/core.js b/server/src/routes/core.js
+index c1d5909..8af1052 100644
+--- a/server/src/routes/core.js
++++ b/server/src/routes/core.js
+@@ -9,6 +9,7 @@ import { state, distKm } from '../ml/placeholder/state.js';
+ import { CategoryProfile, MlModel, Outcome, SearchLog, Poi, Store, Feedback } from '../models/index.js';
+ import { CITY, LOCALITIES } from '../data/city.js';
+ import { catByKey, GROUPS } from '../data/categories.js';
++import { LIVE_KEYS } from '../data/liveSources.js';
+ import { asyncH, bad, notFound, hash, insideCity, inr, round } from '../utils/index.js';
+ import { assumptionsFor, ownStores, resolveCategory, snap, latestVisit } from '../services/context.js';
+ import { buildEvidence, templateSummary, templateCompare, narrate } from '../llm/index.js';
+@@ -45,7 +46,8 @@ r.get('/meta', asyncH(async (req, res) => {
+   res.json({
+     modelVersion: config.modelVersion, mlMode: ml.health().mode, llm: config.llmUrl ? 'llm' : 'template',
+     sources: [
+-      { name: 'OpenStreetMap', detail: 'POIs, roads, land use', licence: 'ODbL', kind: 'real', note: 'Seeded demo uses a simulated extract until the pipeline ingests OSM' },
++      { name: 'OpenStreetMap (live, Overpass API)', detail: `Competitor POIs refreshed every ${process.env.LIVE_REFRESH_HOURS || 12} h for ${LIVE_KEYS.length} categories`, licence: 'ODbL', kind: 'real', note: 'Other categories still use the simulated extract' },
++      { name: 'Official registries', detail: 'FSSAI, FDA Maharashtra, RBI branch master, PESO/OMC, EV operators', licence: 'Public records', kind: 'real', note: 'Adds registered businesses missing from the map; cancelled licences remove them' },
+       { name: 'WorldPop 100 m', detail: 'Population 2015 + 2020', licence: 'CC BY 4.0', kind: 'real', note: 'Seeded demo uses synthesised population' },
+       { name: 'Store revenue, rent, margins', detail: 'Seeded simulator (variant A train, B shift test)', licence: '—', kind: 'simulated' },
+       { name: 'Your uploads', detail: `${await Store.countDocuments({ chain: 'own', ...(req.user ? { owner: req.user._id } : {}) })} stores · ${outcomes} outcomes recorded`, licence: 'Yours', kind: 'yours' },
+@@ -732,6 +734,7 @@ r.get('/shops', asyncH(async (req, res) => {
+       locality: q.locality || cell?.locality || 'Pune',
+       brandClass: q.brandClass || (isOwn ? 'Own Network' : 'Standard'),
+       areaSqft: q.areaSqft || 2500,
++      source: q.source || (isOwn ? 'own' : 'simulated'),
+       isCompetitor: isComp,
+     };
+   };
+diff --git a/server/src/routes/live.js b/server/src/routes/live.js
+new file mode 100644
+index 0000000..74e9be8
+--- /dev/null
++++ b/server/src/routes/live.js
+@@ -0,0 +1,69 @@
++// Live data API: feasibility + sync status (Trust Center), manual refresh, registry upload, what-if closures.
++import { Router } from 'express';
++import { z } from 'zod';
++import { optionalAuth, requireAuth, validate } from '../middleware/index.js';
++import { asyncH, bad, notFound } from '../utils/index.js';
++import { Poi, LiveSync } from '../models/index.js';
++import { catByKey, CATEGORIES } from '../data/categories.js';
++import { LIVE, LIVE_KEYS, feasibilityOf } from '../data/liveSources.js';
++import { syncCategory, syncAll, setCompetitorStatus } from '../services/liveData.js';
++
++const r = Router();
++r.use(optionalAuth);
++
++async function statusOf(key) {
++  const spec = LIVE[key];
++  const [last, lastOk, bySource, closed] = await Promise.all([
++    LiveSync.findOne({ category: key }).sort({ createdAt: -1 }).lean(),
++    LiveSync.findOne({ category: key, ok: true }).sort({ createdAt: -1 }).lean(),
++    Poi.aggregate([{ $match: { category: key, status: { $ne: 'closed' } } }, { $group: { _id: '$source', n: { $sum: 1 } } }]),
++    Poi.aggregate([{ $match: { category: key, status: 'closed' } }, { $group: { _id: '$closedReason', n: { $sum: 1 } } }]),
++  ]);
++  const src = Object.fromEntries(bySource.map((x) => [x._id || 'simulated', x.n]));
++  const live = (src.osm || 0) + (src.registry || 0) + (src['osm+registry'] || 0);
++  return {
++    key, name: catByKey[key]?.name, icon: catByKey[key]?.icon, live: !!spec,
++    feasibility: spec ? feasibilityOf(key) : null, parts: spec?.parts || null, note: spec?.note || null,
++    sources: spec ? [{ name: 'OpenStreetMap (Overpass API)', kind: 'map', refresh: `every ${process.env.LIVE_REFRESH_HOURS || 12} h` }, { ...spec.registry, kind: 'registry' }] : [],
++    mode: live > 0 ? 'live' : 'simulated',
++    counts: { ...src, live, closed: Object.fromEntries(closed.map((x) => [x._id || 'UNKNOWN', x.n])) },
++    lastSync: last ? { at: last.createdAt, ok: last.ok, error: last.error, added: last.added, closed: last.closed, reopened: last.reopened, nameCoverage: last.nameCoverage } : null,
++    lastSuccessAt: lastOk?.createdAt || null,
++  };
++}
++
++r.get('/status', asyncH(async (req, res) => {
++  const keys = req.query.category ? [String(req.query.category)] : LIVE_KEYS;
++  const out = await Promise.all(keys.filter((k) => catByKey[k]).map(statusOf));
++  res.json({ categories: out, liveKeys: LIVE_KEYS, simulatedKeys: CATEGORIES.map((c) => c.key).filter((k) => !LIVE[k]) });
++}));
++
++r.post('/refresh', requireAuth, asyncH(async (req, res) => {
++  const k = req.query.category ? String(req.query.category) : null;
++  if (k && !LIVE[k]) throw bad(`${k} has no live source yet`, 'category');
++  const results = k ? [await syncCategory(k)] : await syncAll();
++  res.json({ results });
++}));
++
++const regSchema = z.object({ rows: z.array(z.object({ name: z.string().min(1), lat: z.coerce.number(), lon: z.coerce.number(), regNo: z.string().optional(), status: z.string().optional() })).min(1).max(5000) });
++r.post('/registry/:category', requireAuth, validate(regSchema), asyncH(async (req, res) => {
++  const k = req.params.category;
++  if (!LIVE[k]) throw bad(`${k} has no live source yet`, 'category');
++  res.json({ result: await syncCategory(k, { extraRegistry: req.body.rows }) });
++}));
++
++// What-if: "this competitor does not exist" → every score, hexagon and recommendation recomputes
++const stSchema = z.object({ status: z.enum(['open', 'closed']), reason: z.enum(['WHAT_IF', 'USER_REPORTED']).default('WHAT_IF') });
++r.post('/competitors/:id/status', requireAuth, validate(stSchema), asyncH(async (req, res) => {
++  const p = await setCompetitorStatus(req.params.id, req.body.status, req.body.reason);
++  if (!p) throw notFound('Competitor not found');
++  res.json({ competitor: { id: String(p._id), name: p.name, category: p.category, status: p.status, closedReason: p.closedReason } });
++}));
++
++r.get('/competitors/closed', asyncH(async (req, res) => {
++  const q = { status: 'closed', ...(req.query.category ? { category: String(req.query.category) } : {}) };
++  const list = await Poi.find(q).sort({ statusChangedAt: -1 }).limit(100).lean();
++  res.json({ competitors: list.map((p) => ({ id: String(p._id), name: p.name, category: p.category, locality: p.locality, closedReason: p.closedReason, at: p.statusChangedAt, source: p.source })) });
++}));
++
++export default r;
+diff --git a/server/src/scripts/seed.js b/server/src/scripts/seed.js
+index 35f82ff..73c58d7 100644
+--- a/server/src/scripts/seed.js
++++ b/server/src/scripts/seed.js
+@@ -35,7 +35,7 @@ async function main() {
+   const keepUsers = process.argv.includes('--keep-users');
+   await mongoose.connect(config.mongoUri);
+   console.log('Connected', config.mongoUri);
+-  await Promise.all([Cell.deleteMany({}), Poi.deleteMany({}), CategoryProfile.deleteMany({}), MlModel.deleteMany({}), Score.deleteMany({}), SearchLog.deleteMany({}), Store.deleteMany({ chain: 'sim' })]);
++  await Promise.all([Cell.deleteMany({}), Poi.deleteMany({ source: { $nin: ['osm', 'registry', 'osm+registry'] } }), CategoryProfile.deleteMany({}), MlModel.deleteMany({}), Score.deleteMany({}), SearchLog.deleteMany({}), Store.deleteMany({ chain: 'sim' })]);
+   if (!keepUsers) await Promise.all([User.deleteMany({}), Store.deleteMany({}), Saved.deleteMany({}), Feedback.deleteMany({}), Outcome.deleteMany({})]);
+ 
+   // ---------- 1. grid + features
+@@ -111,7 +111,9 @@ async function main() {
+   const wsum = weights.reduce((a, b) => a + b, 0);
+   const pick = () => { let x = R() * wsum; for (let i = 0; i < raw.length; i++) { x -= weights[i]; if (x <= 0) return raw[i]; } return raw[raw.length - 1]; };
+   const pois = [];
++  const liveCats = new Set(await Poi.distinct('category', { source: { $in: ['osm', 'registry', 'osm+registry'] } }));
+   for (const cat of CATEGORIES) {
++    if (liveCats.has(cat.key)) continue; // real data already ingested for this category
+     const n = COUNT[cat.key] || 30;
+     const brands = BRANDS[cat.key] || ['Local'];
+     for (let i = 0; i < n; i++) {
+diff --git a/server/src/services/cache.js b/server/src/services/cache.js
+index 8578305..4439fe0 100644
+--- a/server/src/services/cache.js
++++ b/server/src/services/cache.js
+@@ -5,3 +5,4 @@ export function getCache(key) { const v = store.get(key); if (!v) return null; i
+ export function setCache(key, value) { if (store.size > 500) store.delete(store.keys().next().value); store.set(key, { at: Date.now(), value }); }
+ export function clearUserCaches(userId) { for (const k of store.keys()) if (k.includes(userId)) store.delete(k); }
+ export function clearCategory(cat) { for (const k of store.keys()) if (k.includes(`:${cat}:`)) store.delete(k); }
++export function clearAll() { store.clear(); }
+diff --git a/server/src/services/liveData.js b/server/src/services/liveData.js
+new file mode 100644
+index 0000000..d32f8be
+--- /dev/null
++++ b/server/src/services/liveData.js
+@@ -0,0 +1,196 @@
++/**
++ * Live competitor data: OpenStreetMap (Overpass) + official registries → `competitors` collection.
++ *
++ * Each sync, per live category:
++ *   1. fetch every matching OSM node/way/relation inside the Pune & PCMC polygon
++ *   2. merge registry rows (offline businesses not on the map); dedupe within 60 m by name
++ *   3. upsert: new → added (status open); seen again → lastSeen updated / reopened
++ *   4. a POI from a previous live sync that is no longer returned → status closed (NOT_IN_LATEST_OSM)
++ *      a registry row with status closed/cancelled → matching POI closed (REGISTRY_CANCELLED)
++ *   5. simulated POIs of that category are removed once a live sync succeeds
++ *   6. reload the in-memory state → catchments, hexagon scores, recommendations, portfolio all recompute
++ * If Overpass is down, the category keeps its previous data and the failure is logged.
++ */
++import fs from 'fs';
++import path from 'path';
++import { fileURLToPath } from 'url';
++import { parse } from 'csv-parse/sync';
++import { latLngToCell } from 'h3-js';
++import { Poi, LiveSync } from '../models/index.js';
++import { CITY, LOCALITIES } from '../data/city.js';
++import { LIVE, LIVE_KEYS, PUNE_BBOX, feasibilityOf } from '../data/liveSources.js';
++import { insideCity } from '../utils/index.js';
++import { loadState, distKm } from '../ml/placeholder/state.js';
++import { config } from '../config/index.js';
++import { clearAll } from './cache.js';
++
++const __dirname = path.dirname(fileURLToPath(import.meta.url));
++const REGISTRY_DIR = path.resolve(__dirname, '../../data/registry');
++const ENDPOINTS = (process.env.OVERPASS_URLS || 'https://overpass-api.de/api/interpreter,https://overpass.kumi.systems/api/interpreter').split(',').map((s) => s.trim());
++
++const nearestLocality = (lat, lon) => {
++  let best = null, bd = Infinity;
++  for (const l of LOCALITIES) { const d = distKm(lat, lon, l.lat, l.lon); if (d < bd) { bd = d; best = l.name; } }
++  return best;
++};
++const norm = (s = '') => s.toLowerCase().replace(/[^a-z0-9]/g, '');
++const sameName = (a, b) => { const x = norm(a), y = norm(b); return !!x && !!y && (x.includes(y) || y.includes(x)); };
++
++export function overpassQuery(key) {
++  const { s, w, n, e } = PUNE_BBOX;
++  const parts = LIVE[key].overpass.map((q) => `${q}(${s},${w},${n},${e});`).join('');
++  return `[out:json][timeout:60];(${parts});out center tags;`;
++}
++
++let fetchImpl = (...a) => fetch(...a);
++export const _setFetch = (f) => { fetchImpl = f; }; // tests
++
++async function fetchOverpass(key) {
++  const body = 'data=' + encodeURIComponent(overpassQuery(key));
++  let lastErr;
++  for (const url of ENDPOINTS) {
++    const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), 70000);
++    try {
++      const r = await fetchImpl(url, { method: 'POST', body, signal: ctrl.signal, headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'Karyakshetram/1.0 (site selection research)' } });
++      if (!r.ok) throw new Error(`Overpass HTTP ${r.status}`);
++      const j = await r.json();
++      return j.elements || [];
++    } catch (e) { lastErr = e; } finally { clearTimeout(t); }
++  }
++  throw lastErr || new Error('Overpass unreachable');
++}
++
++export function fromOsm(key, el) {
++  const lat = el.lat ?? el.center?.lat, lon = el.lon ?? el.center?.lon;
++  if (lat == null || lon == null || !insideCity(lat, lon, CITY.polygon)) return null;
++  const t = el.tags || {};
++  const spec = LIVE[key];
++  const brandClass = spec.brandClass(t);
++  return {
++    osmId: `${el.type}/${el.id}`, name: t.name || t.brand || t.operator || null, brand: t.brand || t.operator || undefined,
++    category: key, brandClass, areaSqft: spec.area[brandClass] || 1500, lat, lon, source: 'osm',
++  };
++}
++
++export function readRegistry(key) {
++  const f = path.join(REGISTRY_DIR, `${key}.csv`);
++  if (!fs.existsSync(f)) return [];
++  const rows = parse(fs.readFileSync(f), { columns: true, skip_empty_lines: true, trim: true });
++  return normaliseRegistry(key, rows);
++}
++
++/** rows: [{name, lat, lon, regNo?, status?}] – status closed|cancelled|suspended removes the business */
++export function normaliseRegistry(key, rows) {
++  return rows.map((r) => ({
++    name: r.name, lat: Number(r.lat), lon: Number(r.lon), regNo: r.regNo || r.reg_no || r.licence || undefined,
++    closed: /closed|cancel|suspend|revok|surrender/i.test(r.status || ''),
++  })).filter((r) => r.name && Number.isFinite(r.lat) && Number.isFinite(r.lon) && insideCity(r.lat, r.lon, CITY.polygon));
++}
++
++/** Merge OSM + registry into one list of live records and a list of registry closures */
++export function mergeSources(key, osm, registry) {
++  const spec = LIVE[key];
++  const out = osm.map((p) => ({ ...p }));
++  const closures = [];
++  for (const r of registry) {
++    const match = out.find((p) => distKm(p.lat, p.lon, r.lat, r.lon) <= 0.06 && (sameName(p.name, r.name) || !p.name));
++    if (r.closed) { closures.push({ ...r, match }); if (match) match._closed = true; continue; }
++    if (match) { match.source = 'osm+registry'; match.regNo = r.regNo; if (!match.name) match.name = r.name; continue; }
++    const brandClass = spec.brandClass({ name: r.name });
++    out.push({ osmId: `reg/${key}/${r.regNo || norm(r.name) + '@' + r.lat.toFixed(4)}`, name: r.name, category: key, brandClass, areaSqft: spec.area[brandClass] || 1500, lat: r.lat, lon: r.lon, source: 'registry', regNo: r.regNo });
++  }
++  return { records: out.filter((p) => !p._closed), closures };
++}
++
++const running = new Set();
++
++export async function syncCategory(key, { extraRegistry = [], reload = true } = {}) {
++  if (!LIVE[key]) throw new Error(`${key} is not a live category`);
++  if (running.has(key)) return { category: key, skipped: 'already running' };
++  running.add(key);
++  const t0 = Date.now();
++  try {
++    const elements = await fetchOverpass(key);
++    const osm = elements.map((el) => fromOsm(key, el)).filter(Boolean);
++    const registry = [...readRegistry(key), ...normaliseRegistry(key, extraRegistry)];
++    const { records, closures } = mergeSources(key, osm, registry);
++    if (!records.length) throw new Error('Live source returned 0 records; keeping previous data');
++
++    const now = new Date();
++    const existing = await Poi.find({ category: key, source: { $ne: 'simulated' } }).lean();
++    const byId = new Map(existing.map((p) => [p.osmId, p]));
++    const seen = new Set();
++    let added = 0, reopened = 0;
++    const ops = [];
++    for (const p of records) {
++      seen.add(p.osmId);
++      const prev = byId.get(p.osmId);
++      const name = p.name || `${key} outlet`;
++      const set = {
++        name, brand: p.brand, category: key, brandClass: p.brandClass, areaSqft: p.areaSqft, source: p.source, regNo: p.regNo,
++        loc: { type: 'Point', coordinates: [p.lon, p.lat] }, h3: latLngToCell(p.lat, p.lon, 8), locality: nearestLocality(p.lat, p.lon), lastSeen: now,
++      };
++      if (!prev) { added++; Object.assign(set, { status: 'open', firstSeen: now, statusChangedAt: now }); }
++      // closed automatically (vanished/cancelled) but back in the data → reopen; user/what-if closures stay until undone
++      else if (prev.status === 'closed' && ['NOT_IN_LATEST_OSM', 'REGISTRY_CANCELLED'].includes(prev.closedReason)) { reopened++; Object.assign(set, { status: 'open', closedReason: null, statusChangedAt: now }); }
++      ops.push({ updateOne: { filter: { osmId: p.osmId }, update: { $set: set }, upsert: true } });
++    }
++    // vanished from the live sources → no longer exists
++    // only map-only records can "vanish"; registry-backed businesses close via a registry cancellation
++    const vanished = existing.filter((p) => !seen.has(p.osmId) && p.status === 'open' && p.source === 'osm');
++    for (const p of vanished) ops.push({ updateOne: { filter: { _id: p._id }, update: { $set: { status: 'closed', closedReason: 'NOT_IN_LATEST_OSM', statusChangedAt: now } } } });
++    for (const c of closures) if (c.match) ops.push({ updateOne: { filter: { osmId: c.match.osmId }, update: { $set: { status: 'closed', closedReason: 'REGISTRY_CANCELLED', statusChangedAt: now } } } });
++    if (ops.length) await Poi.bulkWrite(ops, { ordered: false });
++    await Poi.deleteMany({ category: key, source: 'simulated' });
++
++    const counts = { osm: 0, registry: 0, both: 0 };
++    for (const p of records) counts[p.source === 'osm+registry' ? 'both' : p.source]++;
++    const nameCoverage = Math.round((osm.filter((p) => p.name).length / Math.max(1, osm.length)) * 100);
++    const log = await LiveSync.create({
++      category: key, ok: true, durationMs: Date.now() - t0, fetched: elements.length, ...counts,
++      open: await Poi.countDocuments({ category: key, status: 'open' }), added, reopened,
++      closed: vanished.length + closures.filter((c) => c.match).length, nameCoverage, feasibility: feasibilityOf(key),
++    });
++    if (reload) await reloadEverywhere();
++    return log.toObject();
++  } catch (e) {
++    await LiveSync.create({ category: key, ok: false, error: String(e.message || e), durationMs: Date.now() - t0, feasibility: feasibilityOf(key) }).catch(() => {});
++    return { category: key, ok: false, error: String(e.message || e) };
++  } finally { running.delete(key); }
++}
++
++export async function syncAll(keys = LIVE_KEYS) {
++  const results = [];
++  for (const k of keys) { results.push(await syncCategory(k, { reload: false })); await new Promise((r) => setTimeout(r, 1500)); } // be polite to Overpass
++  await reloadEverywhere();
++  return results;
++}
++
++/** Reload Node state (clears every score/catchment cache) and tell the Python ML service to reload too */
++export async function reloadEverywhere() {
++  const s = await loadState();
++  clearAll(); // hex layer + recommendation response caches
++  if (config.mlServiceUrl) {
++    fetch(`${config.mlServiceUrl.replace(/\/$/, '')}/ml/reload`, { method: 'POST', headers: { 'X-Internal-Key': config.mlInternalKey } }).catch(() => {});
++  }
++  return s;
++}
++
++/** What-if / user report: mark a competitor as not existing (or restore it) and recompute the whole app */
++export async function setCompetitorStatus(id, status, reason = 'WHAT_IF') {
++  const q = /^[a-f0-9]{24}$/i.test(id) ? { _id: id } : { osmId: id };
++  const p = await Poi.findOneAndUpdate(q, { $set: { status, closedReason: status === 'closed' ? reason : null, statusChangedAt: new Date() } }, { new: true }).lean();
++  if (!p) return null;
++  await reloadEverywhere();
++  return p;
++}
++
++let timer = null;
++export function startScheduler() {
++  const hours = Number(process.env.LIVE_REFRESH_HOURS || 12);
++  if (process.env.LIVE_DATA === 'off' || !hours) return;
++  const run = () => syncAll().then((r) => console.log('[live] sync', r.map((x) => `${x.category}:${x.ok === false ? 'FAIL ' + x.error : x.open + ' open'}`).join(' · '))).catch((e) => console.warn('[live] sync failed', e.message));
++  setTimeout(run, 15000); // first sync shortly after boot
++  timer = setInterval(run, hours * 3600e3);
++  timer.unref?.();
++}
+-- 
+2.43.0
+
+
+From d1007d70eae8396ae53bff93397b73e149c5e55a Mon Sep 17 00:00:00 2001
+From: Ashitosh <ashitoshkumbhar05@gmail.com>
+Date: Sun, 25 Oct 2026 07:39:43 +0000
+Subject: [PATCH 2/2] feat: 10 live categories, Google Places/Open Charge
+ Map/registry/platform connectors, source catalogue + feasibility for all 30
+
+- Live: + restaurant, bakery, gym (10 total)
+- Connectors: Google Places API (New) with businessStatus closures, Open Charge Map (EV), govt registrations, platform feeds (Swiggy/Zomato/brand locators)
+- Multi-source merge: each competitor keeps every source that confirmed it; per-source closure reasons
+- Trust Center: big feasibility % for all 30 categories, per-source type/access/real-time/status table
+- POST /api/live/platform/:category feed endpoint; keys documented (never committed)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A8Nu9DmWHXbSg49PW6bDzz
+---
+ backend/app/model_engine.py               |   2 +-
+ client/.env.example                       |   1 +
+ client/src/components/CompetitorModal.jsx |   4 +-
+ client/src/components/LiveFeasibility.jsx | 165 +++++++++++-------
+ docs/LIVE_DATA.md                         |  91 +++++-----
+ render.yaml                               |   6 +
+ server/.env.example                       |  10 +-
+ server/data/platform/README.md            |  16 ++
+ server/src/data/liveSources.js            | 192 +++++++++++++--------
+ server/src/models/index.js                |   4 +-
+ server/src/routes/core.js                 |   7 +-
+ server/src/routes/live.js                 |  71 +++++---
+ server/src/scripts/seed.js                |   4 +-
+ server/src/services/liveData.js           | 200 +++++++++++++++-------
+ 14 files changed, 498 insertions(+), 275 deletions(-)
+ create mode 100644 server/data/platform/README.md
+
+diff --git a/backend/app/model_engine.py b/backend/app/model_engine.py
+index a790621..bba99f2 100644
+--- a/backend/app/model_engine.py
++++ b/backend/app/model_engine.py
+@@ -186,7 +186,7 @@ class ModelEngine:
+ 
+     SIM_POI_COUNT = {'grocery': 70, 'pharmacy': 90, 'cafe': 70, 'qsr': 60, 'restaurant': 70, 'bakery': 50, 'mobile': 60, 'salon': 55,
+                      'fashion': 45, 'footwear': 40, 'jewellery': 35, 'convenience': 60, 'mall': 8, 'warehouse': 10, 'auto': 22,
+-                     'fuel': 28, 'ev': 18, 'coworking': 20}
++                     'fuel': 28, 'ev': 18, 'coworking': 20, 'gym': 30, 'bank': 30}
+ 
+     def competitor_scale(self, category):
+         if os.environ.get('LIVE_DRIFT_GUARD', 'on') == 'off':
+diff --git a/client/.env.example b/client/.env.example
+index 76462b9..d83f410 100644
+--- a/client/.env.example
++++ b/client/.env.example
+@@ -1,3 +1,4 @@
+ # Leave empty in development (Vite proxies /api to http://localhost:4000).
+ # For a separately hosted API (e.g. Vercel + Render), set the full API base:
+ VITE_API_URL=
++VITE_GOOGLE_MAPS_KEY=
+diff --git a/client/src/components/CompetitorModal.jsx b/client/src/components/CompetitorModal.jsx
+index 4e0a5bc..0fb8ef7 100644
+--- a/client/src/components/CompetitorModal.jsx
++++ b/client/src/components/CompetitorModal.jsx
+@@ -203,8 +203,8 @@ export default function CompetitorAnalysisModal({ open, onClose, shop, activeCat
+                 </button>
+               )}
+               {shop.source && shop.source !== 'own' && (
+-                <span className={`tag ${shop.source === 'simulated' ? 'warn' : 'ok'}`} style={{ fontSize: 11 }}>
+-                  {shop.source === 'simulated' ? 'Simulated record' : shop.source === 'registry' ? 'Registry (offline business)' : shop.source === 'osm+registry' ? 'Live · map + registry' : 'Live · OpenStreetMap'}
++                <span className={`tag ${shop.source === 'simulated' ? 'warn' : 'ok'}`} style={{ fontSize: 11 }} title={(shop.platforms || []).join(', ')}>
++                  {shop.source === 'simulated' ? 'Simulated record' : `Live · ${(shop.sources?.length ? shop.sources : [shop.source]).map((x) => ({ osm: 'OpenStreetMap', gplaces: 'Google Places', ocm: 'Open Charge Map', registry: 'Govt registry', platform: 'Platform' }[x] || x)).join(' + ')}`}
+                 </span>
+               )}
+               {whatIf && !['busy', 'done'].includes(whatIf) && <span className="s12" style={{ color: 'var(--bad, #c33)' }}>{whatIf}</span>}
+diff --git a/client/src/components/LiveFeasibility.jsx b/client/src/components/LiveFeasibility.jsx
+index 75158a1..b79f741 100644
+--- a/client/src/components/LiveFeasibility.jsx
++++ b/client/src/components/LiveFeasibility.jsx
+@@ -1,10 +1,17 @@
+-// Trust Center: real-time data feasibility per live category (big %), source mix, last sync, closures.
+-import { useState } from 'react';
++// Trust Center: real-time data feasibility for all 30 categories (big %), and for the selected category
++// every source (map, public API, government registration, industry platform, brand locator) with its
++// own real-time score and connection status, plus last sync and removed competitors.
++import { useMemo, useState } from 'react';
+ import { useApi, useAuth } from '../lib/state.jsx';
+ import { api } from '../lib/api.js';
+ import { Icon, Skel } from './ui.jsx';
+ 
+-const PART_LABEL = { mapCoverage: 'Map coverage', registry: 'Registry quality', freshness: 'Freshness', brandSignal: 'Brand signal' };
++const PART_LABEL = { mapCoverage: 'Map coverage', registry: 'Govt registration', freshness: 'Freshness', platformSignal: 'Platform & brand signal' };
++const TYPE = {
++  map: ['Map', 'map-2-line'], api: ['Public API', 'code-s-slash-line'], govt: ['Govt registration', 'government-line'],
++  platform: ['Industry platform', 'apps-line'], brand: ['Brand locator', 'store-2-line'],
++};
++const INTEG = { integrated: ['Auto-fetched', 'ok'], import: ['Feed import ready', 'info'], planned: ['Planned', ''] };
+ const ago = (d) => {
+   if (!d) return 'never';
+   const m = Math.round((Date.now() - new Date(d)) / 60000);
+@@ -14,91 +21,127 @@ const tone = (p) => (p >= 80 ? 'var(--ok)' : p >= 65 ? 'var(--accent)' : 'var(--
+ 
+ export default function LiveFeasibility({ selected, onSelect }) {
+   const { user } = useAuth();
+-  const st = useApi('/live/status', []);
++  const all = useApi('/live/status', []);
++  const det = useApi(`/live/status?category=${selected}`, [selected]);
+   const closed = useApi(`/live/competitors/closed?category=${selected}`, [selected]);
+-  const restore = async (id) => {
+-    setBusy(id);
+-    try { await api(`/live/competitors/${id}/status`, { method: 'POST', body: { status: 'open', reason: 'WHAT_IF' } }); closed.refetch(); st.refetch(); setMsg('Restored · scores recomputed'); } catch (e) { setMsg(e.message); } finally { setBusy(null); }
+-  };
+   const [busy, setBusy] = useState(null);
+   const [msg, setMsg] = useState(null);
+-  const cats = st.data?.categories || [];
+-  const cur = cats.find((c) => c.key === selected);
++  const [filter, setFilter] = useState('all');
++  const cats = useMemo(() => {
++    const list = [...(all.data?.categories || [])].sort((a, b) => (b.live - a.live) || (b.feasibility - a.feasibility));
++    return filter === 'live' ? list.filter((c) => c.live) : list;
++  }, [all.data, filter]);
++  const cur = det.data?.categories?.[0];
++  const liveCount = (all.data?.categories || []).filter((c) => c.live).length;
+ 
++  const refetchAll = () => { all.refetch(); det.refetch(); closed.refetch(); };
+   const refresh = async (key) => {
+     setBusy(key); setMsg(null);
+     try {
+-      const { results } = await api(`/live/refresh?category=${key}`, { method: 'POST', timeout: 120000 });
++      const { results } = await api(`/live/refresh?category=${key}`, { method: 'POST', timeout: 180000 });
+       const r = results[0];
+-      setMsg(r.ok === false ? `Live fetch failed: ${r.error}. Previous data kept.` : `Synced: ${r.open} open · +${r.added} new · ${r.closed} closed`);
+-      st.refetch();
++      setMsg(r.ok === false ? `Live fetch failed: ${r.error}. Previous data kept.` : `Synced: ${r.open} open · +${r.added} new · ${r.closed} closed${r.warnings?.length ? ` · ${r.warnings.join('; ')}` : ''}`);
++      refetchAll();
+     } catch (e) { setMsg(e.message); } finally { setBusy(null); }
+   };
++  const restore = async (id) => {
++    setBusy(id);
++    try { await api(`/live/competitors/${id}/status`, { method: 'POST', body: { status: 'open', reason: 'WHAT_IF' } }); refetchAll(); setMsg('Restored · scores recomputed'); } catch (e) { setMsg(e.message); } finally { setBusy(null); }
++  };
+ 
+   return (
+     <div className="card pad20 col g16 shadow" style={{ background: 'var(--bg)' }}>
+       <div className="row sb ac wrap g8">
+-        <div className="col g4">
++        <div className="col g4" style={{ maxWidth: 760 }}>
+           <div className="h4 row g6 ac"><Icon n="broadcast-line" s={18} c="var(--accent)" /> Real-time data feasibility</div>
+-          <span className="s13 muted">Share of the real market we can see with free, refreshable data (OpenStreetMap + official registries). Competitors that close drop out automatically and every score recomputes.</span>
++          <span className="s13 muted">How much of the real market we can see with refreshable data: maps, public APIs (Google Places, Open Charge Map), government registrations (FSSAI, FDA, RBI, PESO, BIS, GST…) and industry platforms (Swiggy, Zomato, Blinkit, Practo, brand locators). Competitors that close drop out automatically and every score recomputes.</span>
++        </div>
++        <div className="row g6 ac">
++          <button type="button" className={`chip ${filter === 'all' ? 'on' : ''}`} onClick={() => setFilter('all')}>All 30</button>
++          <button type="button" className={`chip ${filter === 'live' ? 'on' : ''}`} onClick={() => setFilter('live')}>{liveCount} live</button>
+         </div>
+-        <span className="tag info">{cats.length} live categories · others simulated</span>
+       </div>
+ 
+-      {!st.data ? <Skel h={150} /> : (
+-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 12 }}>
++      {!all.data ? <Skel h={180} /> : (
++        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(138px, 1fr))', gap: 10, maxHeight: 430, overflowY: 'auto', paddingRight: 4 }}>
+           {cats.map((c) => (
+-            <button key={c.key} type="button" onClick={() => onSelect?.(c.key)} className="card pad16 col g4"
+-              style={{ textAlign: 'left', cursor: 'pointer', border: c.key === selected ? '2px solid var(--accent)' : '1px solid var(--line)', background: 'var(--surface, var(--bg))' }}>
+-              <span className="s12 muted row g6 ac"><Icon n={c.icon} s={14} /> {c.name}</span>
+-              <span className="num b" style={{ fontSize: 44, lineHeight: 1.05, color: tone(c.feasibility) }}>{c.feasibility}%</span>
+-              <span className="s11 muted">{c.mode === 'live' ? `${c.counts.live} live outlets` : 'Awaiting first live sync'}</span>
+-              <span className={`tag ${c.mode === 'live' ? 'ok' : 'warn'}`} style={{ alignSelf: 'flex-start', fontSize: 11 }}>{c.mode === 'live' ? `Live · ${ago(c.lastSuccessAt)}` : 'Simulated'}</span>
++            <button key={c.key} type="button" onClick={() => onSelect?.(c.key)} className="card pad12 col g4"
++              style={{ textAlign: 'left', cursor: 'pointer', border: c.key === selected ? '2px solid var(--accent)' : '1px solid var(--line)', background: 'var(--surface, var(--bg))', minWidth: 0 }}>
++              <span className="s11 muted row g4 ac" style={{ minHeight: 30 }}><Icon n={c.icon} s={13} /> {c.name}</span>
++              <span className="num b" style={{ fontSize: 40, lineHeight: 1.05, color: tone(c.feasibility) }}>{c.feasibility}%</span>
++              <span className={`tag ${c.mode === 'live' ? 'ok' : c.live ? 'info' : ''}`} style={{ alignSelf: 'flex-start', fontSize: 10 }}>
++                {c.mode === 'live' ? `Live · ${c.liveOutlets ?? ''} · ${ago(c.lastSuccessAt)}` : c.live ? 'Live · awaiting sync' : 'Simulated · sources mapped'}
++              </span>
+             </button>
+           ))}
+         </div>
+       )}
+ 
+-      {cur && (
+-        <div className="row g16 as stack-md" style={{ borderTop: '1px solid var(--line)', paddingTop: 14 }}>
+-          <div className="col g6 f1">
+-            <b className="s14">{cur.name}: how {cur.feasibility}% is built</b>
+-            {Object.entries(cur.parts).map(([k, v]) => (
+-              <div key={k} className="row g8 ac s12">
+-                <span style={{ width: 120 }} className="muted">{PART_LABEL[k]}</span>
+-                <div className="f1" style={{ height: 8, background: 'var(--line)', borderRadius: 4 }}><div style={{ width: `${v}%`, height: 8, borderRadius: 4, background: tone(v) }} /></div>
+-                <span className="num" style={{ width: 36, textAlign: 'right' }}>{v}%</span>
+-              </div>
+-            ))}
+-            <span className="s11 faint">Feasibility = 40% map coverage + 25% registry + 20% freshness + 15% brand signal. Assessed estimate for Pune, not a measured census.</span>
+-            <span className="s12 muted" style={{ lineHeight: 1.5 }}>{cur.note}</span>
+-          </div>
+-          <div className="col g6 f1 s13">
+-            {cur.sources.map((s) => (
+-              <div key={s.name} className="row g8 ac"><Icon n={s.kind === 'map' ? 'map-2-line' : 'file-list-3-line'} s={14} c="var(--accent)" /><span className="f1">{s.name}{s.field ? <span className="muted s12"> · {s.field}</span> : null}{s.refresh ? <span className="muted s12"> · {s.refresh}</span> : null}</span></div>
+-            ))}
+-            <div className="s12 muted">
+-              On map: {(cur.counts.osm || 0) + (cur.counts['osm+registry'] || 0)} · Registry only (offline businesses): {cur.counts.registry || 0} · Verified in both: {cur.counts['osm+registry'] || 0}
++      {!cur ? <Skel h={220} /> : (
++        <div className="col g14" style={{ borderTop: '1px solid var(--line)', paddingTop: 14 }}>
++          <div className="row g16 as stack-md">
++            <div className="col g6" style={{ width: 300, maxWidth: '100%' }}>
++              <span className="s12 muted">{cur.name}</span>
++              <span className="num b" style={{ fontSize: 64, lineHeight: 1, color: tone(cur.feasibility) }}>{cur.feasibility}%</span>
++              <span className="s12 muted">real-time data feasibility</span>
++              {Object.entries(cur.parts).map(([k, v]) => (
++                <div key={k} className="row g8 ac s12">
++                  <span style={{ width: 128 }} className="muted">{PART_LABEL[k]}</span>
++                  <div className="f1" style={{ height: 8, background: 'var(--line)', borderRadius: 4 }}><div style={{ width: `${v}%`, height: 8, borderRadius: 4, background: tone(v) }} /></div>
++                  <span className="num" style={{ width: 34, textAlign: 'right' }}>{v}%</span>
++                </div>
++              ))}
++              <span className="s11 faint">40% map + 25% registration + 20% freshness + 15% platform signal. Assessed estimate for Pune.</span>
++              <span className="s12 muted" style={{ lineHeight: 1.5 }}>{cur.note}</span>
+             </div>
+-            <div className="s12 muted">
+-              No longer exist: {Object.values(cur.counts.closed || {}).reduce((a, b) => a + b, 0)}
+-              {Object.keys(cur.counts.closed || {}).length > 0 && ` (${Object.entries(cur.counts.closed).map(([k, v]) => `${k.replace(/_/g, ' ').toLowerCase()}: ${v}`).join(', ')})`}
+-            </div>
+-            {cur.lastSync && <div className="s12 muted">Last sync {ago(cur.lastSync.at)} · {cur.lastSync.ok ? `+${cur.lastSync.added || 0} new, ${cur.lastSync.closed || 0} closed, ${cur.lastSync.nameCoverage ?? '—'}% named` : `failed: ${cur.lastSync.error}`}</div>}
+-            {user && <button type="button" className="btn out sm" style={{ alignSelf: 'flex-start' }} disabled={!!busy} onClick={() => refresh(cur.key)}><Icon n="refresh-line" s={14} /> {busy === cur.key ? 'Fetching live data…' : 'Refresh now'}</button>}
+-            {msg && <span className="s12">{msg}</span>}
+-            {(closed.data?.competitors || []).length > 0 && (
+-              <div className="col g4" style={{ borderTop: '1px solid var(--line)', paddingTop: 8 }}>
+-                <b className="s12">Removed competitors (what-if / closed)</b>
+-                {closed.data.competitors.slice(0, 6).map((p) => (
+-                  <div key={p.id} className="row g8 ac s12">
+-                    <span className="f1">{p.name} <span className="muted">· {p.locality} · {(p.closedReason || '').replace(/_/g, ' ').toLowerCase()}</span></span>
+-                    {user && ['WHAT_IF', 'USER_REPORTED'].includes(p.closedReason) && <button type="button" className="btn ghost sm" disabled={!!busy} onClick={() => restore(p.id)}>Restore</button>}
+-                  </div>
+-                ))}
++
++            <div className="col g8 f1" style={{ minWidth: 0 }}>
++              <b className="s13">Sources for {cur.name}</b>
++              <div style={{ overflowX: 'auto' }}>
++                <table className="t" style={{ minWidth: 560 }}>
++                  <thead><tr><th>Source</th><th>Type</th><th>Access</th><th>Real-time</th><th>Status</th></tr></thead>
++                  <tbody>
++                    {cur.sources.map((s) => (
++                      <tr key={s.id}>
++                        <td><span className="b s12">{s.name}</span><div className="s11 muted">{s.note} · {s.refresh}</div></td>
++                        <td><span className="row g4 ac s12"><Icon n={TYPE[s.type][1]} s={13} c="var(--accent)" />{TYPE[s.type][0]}</span></td>
++                        <td className="s11 muted">{s.access}</td>
++                        <td><span className="num b" style={{ color: tone(s.realtime) }}>{s.realtime}%</span></td>
++                        <td>
++                          {s.connected ? <span className="tag ok" style={{ fontSize: 10 }}>Connected{s.records ? ` · ${s.records}` : ''}</span>
++                            : <span className={`tag ${INTEG[s.integration][1]}`} style={{ fontSize: 10 }}>{INTEG[s.integration][0]}</span>}
++                        </td>
++                      </tr>
++                    ))}
++                  </tbody>
++                </table>
+               </div>
+-            )}
++            </div>
+           </div>
++
++          {cur.live && (
++            <div className="row g16 as stack-md s12 muted">
++              <div className="col g4 f1">
++                <span>Removed (no longer exist): {Object.values(cur.counts?.closed || {}).reduce((a, b) => a + b, 0)}
++                  {Object.keys(cur.counts?.closed || {}).length > 0 && ` (${Object.entries(cur.counts.closed).map(([k, v]) => `${k.replace(/_/g, ' ').toLowerCase()}: ${v}`).join(', ')})`}</span>
++                {cur.lastSync && <span>Last sync {ago(cur.lastSync.at)} · {cur.lastSync.ok ? `+${cur.lastSync.added || 0} new, ${cur.lastSync.closed || 0} closed, ${cur.lastSync.nameCoverage ?? '—'}% named` : `failed: ${cur.lastSync.error}`}{cur.lastSync.warnings?.length ? ` · ${cur.lastSync.warnings.join('; ')}` : ''}</span>}
++                {user && <button type="button" className="btn out sm" style={{ alignSelf: 'flex-start' }} disabled={!!busy} onClick={() => refresh(cur.key)}><Icon n="refresh-line" s={14} /> {busy === cur.key ? 'Fetching live data…' : 'Refresh now'}</button>}
++                {msg && <span className="s12" style={{ color: 'var(--text)' }}>{msg}</span>}
++              </div>
++              {(closed.data?.competitors || []).length > 0 && (
++                <div className="col g4 f1">
++                  <b className="s12" style={{ color: 'var(--text)' }}>Removed competitors (closed / what-if)</b>
++                  {closed.data.competitors.slice(0, 6).map((p) => (
++                    <div key={p.id} className="row g8 ac">
++                      <span className="f1">{p.name} · {p.locality} · {(p.closedReason || '').replace(/_/g, ' ').toLowerCase()}</span>
++                      {user && ['WHAT_IF', 'USER_REPORTED'].includes(p.closedReason) && <button type="button" className="btn ghost sm" disabled={!!busy} onClick={() => restore(p.id)}>Restore</button>}
++                    </div>
++                  ))}
++                </div>
++              )}
++            </div>
++          )}
++          {!cur.live && <span className="s12 muted">This category still runs on the simulated layer. Its sources are mapped above; switching it to live needs an OSM tag + Google Places type entry in <code>liveSources.js</code> and, optionally, registry/platform feeds.</span>}
+         </div>
+       )}
+     </div>
+diff --git a/docs/LIVE_DATA.md b/docs/LIVE_DATA.md
+index 62ab8cd..b7e6da7 100644
+--- a/docs/LIVE_DATA.md
++++ b/docs/LIVE_DATA.md
+@@ -1,43 +1,56 @@
+ # Live competitor data
+ 
+-Seven categories now take their competitor layer from real data instead of the simulator:
+-**grocery, pharmacy, qsr, cafe, fuel, bank, ev**. Every other category stays simulated and is labelled as such.
+-
+-| Category | Feasibility | Map source (OSM tags) | Registry for offline businesses |
+-|---|---|---|---|
+-| Fuel station | **89%** | `amenity=fuel` | PESO licences, IOCL/BPCL/HPCL outlet locators |
+-| Banking & NBFC | **86%** | `amenity=bank` | RBI branch master / IFSC list |
+-| QSR & fast food | **72%** | `amenity=fast_food` | FSSAI FoSCoS |
+-| Pharmacy | **70%** | `amenity=pharmacy`, `shop=chemist` | FDA Maharashtra drug licences |
+-| Cafe & coffee | **67%** | `amenity=cafe` | FSSAI FoSCoS |
+-| Supermarket & grocery | **64%** | `shop=supermarket|grocery`, food wholesale | FSSAI FoSCoS |
+-| EV charging | **62%** | `amenity=charging_station` | BEE list, Tata Power EZ / Statiq / ChargeZone |
+-
+-Feasibility = 40% map coverage + 25% registry quality + 20% freshness + 15% brand signal (assessed estimates, `server/src/data/liveSources.js`).
+-
+-## How it flows
+-1. `startScheduler()` runs 15 s after boot, then every `LIVE_REFRESH_HOURS` (default 12). `LIVE_DATA=off` disables it.
+-2. `syncCategory()` pulls Overpass, filters to the Pune & PCMC polygon, merges `server/data/registry/<key>.csv`, dedupes within 60 m.
+-3. New outlets are added; map outlets missing from the latest pull become `closed / NOT_IN_LATEST_OSM`; cancelled licences become `closed / REGISTRY_CANCELLED`; outlets that come back are reopened.
+-4. Simulated POIs of that category are deleted only after a successful live pull. A failed or empty pull keeps the old data.
+-5. `reloadEverywhere()` reloads Node state, clears catchment + response caches and calls `POST /ml/reload` on the Python service, so hexagons, scores, recommendations, stress tests, portfolio and cannibalisation all recompute.
+-
+-## What-if: "this competitor doesn't exist"
+-Competitor modal → **What if this competitor doesn't exist?** → `POST /api/live/competitors/:id/status {status:"closed"}`.
+-The whole app recomputes. Restore from Trust Center → Real-time data feasibility → Removed competitors.
+-What-if closures are global (shared by all users) and are never reopened by the scheduler.
++**10 live categories** (fetched automatically): grocery, pharmacy, qsr, cafe, fuel, bank, ev, restaurant, bakery, gym.
++**All 30 categories** have a source catalogue and a real-time feasibility score in the Trust Center
++(`server/src/data/liveSources.js`). The other 20 still score on the simulated layer, and the UI labels them that way.
++
++## Keys
++| Variable | Where | Purpose |
++|---|---|---|
++| `GOOGLE_PLACES_KEY` | server only (Render env, `server/.env`) | Google Places API (New): competitors + businessStatus closures. **Never commit it.** |
++| `VITE_GOOGLE_MAPS_KEY` | client build | Google Maps JavaScript API basemap under the hex layer. Restrict it to your site's HTTP referrers in Google Cloud. |
++| `OCM_API_KEY` | server | Open Charge Map (EV) |
++| `PLATFORM_FEED_URLS` / `PLATFORM_FEED_TOKEN` | server | Swiggy/Zomato partner exports, brand locator feeds |
++
++## Connectors
++| Connector | Type | How | Real-time | Closure signal |
++|---|---|---|---|---|
++| OpenStreetMap Overpass | Map | Always on, free | 70% | missing from latest pull (map-only records) |
++| Google Places API (New) | Public API | `GOOGLE_PLACES_KEY` (paid) | 92% | `businessStatus` CLOSED_* |
++| Open Charge Map | Public API | EV, `OCM_API_KEY` | 75% | `IsOperational=false` |
++| Government registrations | Govt | `data/registry/<key>.csv/json` or `POST /api/live/registry/:cat` | 35–80% | cancelled/suspended licence |
++| Industry platforms & brand locators | Platform | `data/platform/<key>.json/csv`, `PLATFORM_FEED_URLS`, or `POST /api/live/platform/:cat` | 45–90% | delisted / unserviceable |
++
++Registers mapped: FSSAI, FDA Maharashtra, RBI branch master/IFSC, PESO + OMC locators, BEE, NABL, BIS hallmark, GST,
++Udyam, MCA, Shop & Establishment (Gumasta), VAHAN, MahaRERA, WDRA/MIDC, India Post, UDISE+/AISHE, Vet Council.
++Platforms mapped: Swiggy, Zomato, Blinkit/Zepto/Instamart, Justdial, Practo/Healthians, IndiaMART, Cult.fit,
++Tata Power EZ/Statiq/ChargeZone, NoBroker/99acres/MagicBricks, myHQ/Awfis/WeWork, plus OEM and chain store locators.
++Swiggy, Zomato, Blinkit and Justdial have no public API and their terms prohibit scraping. They come in as partner or
++licensed feeds; the app never scrapes them itself.
++
++Google Places cost: each live category makes up to `GOOGLE_PLACES_TILES² × 3` Text Search calls per sync
++(3 → max 27 calls per category, 270 per full sync). At 12-hourly syncs that is about 16k calls a month, so watch billing
++or raise `LIVE_REFRESH_HOURS`.
++
++## Feasibility
++`feasibility = 0.4·map coverage + 0.25·govt registration + 0.2·freshness + 0.15·platform & brand signal` (assessed estimates for Pune).
++
++Live: fuel 88 · bank 86 · restaurant 78 · qsr 78 · pharmacy 75 · cafe 73 · bakery 69 · grocery 68 · ev 63 · gym 58.
++Mapped only: mall 73 · auto 72 · jewellery 66 · diagnostics 63 · electronics 62 · coworking 61 · courier 60 · fashion 58 ·
++mobile 57 · footwear 56 · convenience 55 · warehouse 55 · salon 54 · dairy 54 · qcommerce 53 · furniture 53 · hardware 50 ·
++pet 49 · carwash 49 · coaching 46.
++
++## Merge & lifecycle
++* Records within 60 m with matching names are treated as one business; each keeps every source that confirmed it.
++* A closed signal from any source → closed with a reason. Seen again after an automatic closure → reopened. What-if closures stick until restored.
++* Simulated POIs are deleted only after a successful live pull. A failure keeps the previous data and logs warnings.
++* After every sync: Node state reloads, caches clear, and `POST /ml/reload` goes to the Python service.
+ 
+ ## API
+-* `GET  /api/live/status[?category=]`: feasibility, source mix, last sync, closures
+-* `POST /api/live/refresh[?category=]`: sync now (login)
+-* `POST /api/live/registry/:category` `{rows:[{name,lat,lon,regNo,status}]}`: merge registry rows (login)
+-* `POST /api/live/competitors/:id/status` `{status:"open"|"closed", reason}`: what-if (login)
+-* `GET  /api/live/competitors/closed[?category=]`
+-
+-## Does the model need retraining?
+-* **Placeholder engine (what Render runs today, no `ML_SERVICE_URL`)**: no. It scores competition relative to the city median (`compRef`), so it adapts to real counts automatically.
+-* **Python RandomForest (`backend/`)**: trained on 357 rows of *simulated* competitor counts and *simulated* revenue (spatial-CV R² 0.14).
+-  Real OSM layers are several times denser, so raw counts would fall outside the training range, where a forest just
+-  returns its edge leaf. A **drift guard** (`competitor_scale`, `LIVE_DRIFT_GUARD=on`) rescales live counts to the training
+-  density so the model sees relative intensity. Retraining on live features only makes sense once there is **real revenue**
+-  (own-store uploads / outcomes); retraining on the simulator's revenue would just re-learn the simulator.
++`GET /api/live/status[?category=]` · `POST /api/live/refresh[?category=]` · `POST /api/live/registry/:category` ·
++`POST /api/live/platform/:category` · `POST /api/live/competitors/:id/status` · `GET /api/live/competitors/closed`
++
++## Model retraining
++* Placeholder engine (what runs on Render): no retraining needed. Competition is scored relative to the city median.
++* Python RandomForest: trained on simulated counts and revenue. The `competitor_scale` drift guard rescales live counts
++  into the training range. Retrain once real revenue/outcome labels exist.
+diff --git a/render.yaml b/render.yaml
+index c4d12f3..93977fc 100644
+--- a/render.yaml
++++ b/render.yaml
+@@ -25,6 +25,12 @@ services:
+         value: "on"
+       - key: LIVE_REFRESH_HOURS
+         value: 12
++      - key: GOOGLE_PLACES_KEY
++        sync: false
++      - key: OCM_API_KEY
++        sync: false
++      - key: PLATFORM_FEED_URLS
++        sync: false
+       - key: MODEL_VERSION
+         value: rf-300-v1.0.0
+       - key: GEMINI_API_KEY
+diff --git a/server/.env.example b/server/.env.example
+index 3dafa31..9f83854 100644
+--- a/server/.env.example
++++ b/server/.env.example
+@@ -18,7 +18,15 @@ LLM_URL=
+ LLM_API_KEY=
+ 
+ # ---- Live competitor data (OpenStreetMap Overpass + official registries)
+-# Live categories: grocery, pharmacy, qsr, cafe, fuel, bank, ev. Others stay simulated.
++# Live categories: grocery, pharmacy, qsr, cafe, fuel, bank, ev, restaurant, bakery, gym. Others stay simulated.
+ LIVE_DATA=on
+ LIVE_REFRESH_HOURS=12
+ # OVERPASS_URLS=https://overpass-api.de/api/interpreter,https://overpass.kumi.systems/api/interpreter
++# Google Places API (New) – adds near-real-time businessStatus (closed permanently/temporarily). Paid per call.
++GOOGLE_PLACES_KEY=
++GOOGLE_PLACES_TILES=3
++# Open Charge Map (EV)
++# OCM_API_KEY=
++# Platform feeds (Swiggy/Zomato partner exports, brand locators…) – JSON map category → URL
++# PLATFORM_FEED_URLS={"restaurant":"https://…/restaurants.json"}
++# PLATFORM_FEED_TOKEN=
+diff --git a/server/data/platform/README.md b/server/data/platform/README.md
+new file mode 100644
+index 0000000..78d8a23
+--- /dev/null
++++ b/server/data/platform/README.md
+@@ -0,0 +1,16 @@
++# Platform feeds (industry platforms & brand locators)
++
++One file per live category: `restaurant.json`, `qsr.csv`, `bakery.json`, `gym.csv` …
++Or set `PLATFORM_FEED_URLS={"restaurant":"https://feed.example.com/pune-restaurants.json"}` (+ optional `PLATFORM_FEED_TOKEN`),
++or POST `{ "rows": [...] }` to `/api/live/platform/:category`.
++
++```json
++[{ "name": "Cloud Kitchen X", "lat": 18.60, "lon": 73.76, "platform": "swiggy", "id": "sw-123", "status": "open" }]
++```
++
++`status` containing delisted / closed / unserviceable / inactive marks the outlet as no longer existing.
++
++Typical feeds: Swiggy & Zomato (partner programme or a licensed dataset), Blinkit / Zepto / Instamart serviceability,
++Practo / Healthians labs, Cult.fit & chain gym locators, OEM dealer locators, chain store locators (Croma, Bata, Tanishq …).
++Swiggy, Zomato and similar platforms have no public API and their terms prohibit scraping, so the app takes these
++as feeds rather than scraping them itself.
+diff --git a/server/src/data/liveSources.js b/server/src/data/liveSources.js
+index d9db753..4d79ceb 100644
+--- a/server/src/data/liveSources.js
++++ b/server/src/data/liveSources.js
+@@ -1,92 +1,136 @@
+ /**
+- * LIVE DATA SOURCES — categories whose competitor layer comes from real, frequently-changing data
+- * instead of the seeded simulator.
++ * LIVE DATA SOURCES
+  *
+- *  1. OpenStreetMap via the Overpass API (free, no key, edited daily by the community).
+- *  2. Official registries for businesses that are NOT on the map (FSSAI, FDA drug licences, RBI branch
+- *     master, oil-company outlet lists, EV operator lists). Rows go in server/data/registry/<key>.csv
+- *     or are POSTed to /api/live/registry/:category. A registry row with status=closed/cancelled
+- *     removes the matching map POI.
++ * SOURCE LIBRARY (SRC): every external source the app can use, with
++ *   type        map | api | govt | platform | brand
++ *   access      how we can legally get it (open API, keyed API, public portal, partner feed, store locator)
++ *   refresh     how fast changes show up
++ *   realtime    0–100: how close to real time the source is (100 = status changes visible within hours)
++ *   integration integrated (pulled automatically by liveData.js) | import (CSV/JSON feed endpoint ready) | planned
+  *
+- * `feasibility` = how much of the real market for this category we can actually see with free,
+- * refreshable data in Pune today (0–100). It is an assessed estimate made up of four parts, shown in the
+- * Trust Center:
+- *   mapCoverage   – share of real outlets likely present on OSM in Pune
+- *   registry      – how usable the official registry is (open, geocodable, current)
+- *   freshness     – how quickly closures/openings show up
+- *   brandSignal   – share of POIs carrying a brand/name usable for brand-class sizing
+- * feasibility = round(0.4·mapCoverage + 0.25·registry + 0.2·freshness + 0.15·brandSignal)
+- * After each live sync the API also reports a measured `nameCoverage` (share of fetched POIs with a name).
++ * CATALOGUE: all 30 categories → which sources apply + feasibility parts.
++ *   feasibility = round(0.4·mapCoverage + 0.25·registry + 0.2·freshness + 0.15·platformSignal)
++ *   mapCoverage    – share of real outlets visible on OSM / Google Places in Pune
++ *   registry       – how complete & usable the government registration list is
++ *   freshness      – how quickly openings/closures appear in the best available source
++ *   platformSignal – coverage from industry platforms & brand store locators (Swiggy, Zomato, Practo, OEM locators…)
++ * These are assessed estimates for Pune, shown in the Trust Center as such.
++ *
++ * LIVE: the 10 categories whose competitor layer is fetched automatically today.
++ *
++ * Platforms without a public API (Swiggy, Zomato, Blinkit, Zepto, Justdial, Practo…) are ingested through the
++ * platform-feed importer (partner API export, licensed dataset or a ToS-compliant collection job) – the app
++ * never scrapes them directly.
+  */
+ 
+ export const PUNE_BBOX = { s: 18.44, w: 73.715, n: 18.695, e: 73.995 };
+ 
++// id: [name, type, access, refresh, realtime, integration, note]
++const LIB = {
++  osm: ['OpenStreetMap (Overpass API)', 'map', 'Open API · free · ODbL', 'Daily community edits', 70, 'integrated', 'Shops, amenities, brands; closures removed by mappers'],
++  gplaces: ['Google Places API (New)', 'api', 'Keyed API · paid per call (GOOGLE_PLACES_KEY)', 'Near real time', 92, 'integrated', 'businessStatus flags CLOSED_PERMANENTLY / CLOSED_TEMPORARILY'],
++  ocm: ['Open Charge Map API', 'api', 'Open API · free key (OCM_API_KEY)', 'Daily', 75, 'integrated', 'Charger status IsOperational'],
++  shopact: ['Maharashtra Shop & Establishment (Gumasta) registrations', 'govt', 'Public portal (aaplesarkar) · bulk via RTI / dept.', 'Monthly', 40, 'import', 'Every shop with staff must register'],
++  gst: ['GST registration (GSTIN search)', 'govt', 'GSP / public search API', 'Weekly', 55, 'import', 'Active / cancelled status per GSTIN'],
++  udyam: ['Udyam MSME registration', 'govt', 'Public verification portal', 'Monthly', 35, 'import', 'Small-business census; NIC activity code'],
++  mca: ['MCA company master (data.gov.in OGD API)', 'govt', 'Open API · free key', 'Monthly', 35, 'import', 'Registered office + status (active/struck off)'],
++  fssai: ['FSSAI FoSCoS licence register', 'govt', 'Public search portal', 'Weekly', 60, 'import', 'Every food business; cancelled licences = closed'],
++  fda: ['FDA Maharashtra retail drug licences', 'govt', 'Public portal / dept. list', 'Monthly', 55, 'import', 'Form 20/21 licence per chemist'],
++  rbi: ['RBI bank branch master + IFSC (data.gov.in)', 'govt', 'Open download / API', 'Weekly', 80, 'import', 'Every branch with IFSC; merged/closed branches flagged'],
++  peso: ['PESO licences + OMC outlet locators (IOCL/BPCL/HPCL)', 'govt', 'Public portal + locator APIs', 'Weekly', 80, 'import', 'Licensed fuel outlets'],
++  bee: ['BEE public EV charger list', 'govt', 'Public list (data.gov.in)', 'Monthly', 50, 'import', 'Sanctioned public chargers'],
++  nabl: ['NABL accredited labs directory', 'govt', 'Public search portal', 'Monthly', 50, 'import', 'Accreditation status (active/suspended)'],
++  bis: ['BIS registered (hallmarking) jewellers', 'govt', 'Public search portal (BIS Care)', 'Monthly', 55, 'import', 'Mandatory HUID registration for jewellers'],
++  vahan: ['Parivahan VAHAN dashboard + trade certificates', 'govt', 'Public dashboard', 'Daily', 70, 'import', 'Dealer trade certificates; registrations per RTO = demand'],
++  rera: ['MahaRERA project register', 'govt', 'Public portal', 'Weekly', 55, 'import', 'Upcoming malls, commercial & office projects'],
++  wdra: ['WDRA registered warehouses + MIDC allotments', 'govt', 'Public list', 'Monthly', 45, 'import', 'Registered warehouse capacity'],
++  indiapost: ['India Post office directory (data.gov.in API)', 'govt', 'Open API · free key', 'Monthly', 40, 'import', 'Post offices with pincode'],
++  udise: ['UDISE+ schools & AISHE colleges', 'govt', 'Open data', 'Yearly', 20, 'import', 'Student demand anchors'],
++  vet: ['Maharashtra State Veterinary Council register', 'govt', 'Public list', 'Yearly', 25, 'import', 'Registered vets / clinics'],
++  swiggy: ['Swiggy listings', 'platform', 'Partner feed / licensed dataset (no public API)', 'Real time', 90, 'import', 'Open / closed / unserviceable status, cuisine, rating'],
++  zomato: ['Zomato listings', 'platform', 'Partner feed / licensed dataset (no public API)', 'Real time', 90, 'import', 'Dining + delivery listings; delisted = closed'],
++  qcom: ['Blinkit / Zepto / Swiggy Instamart serviceability', 'platform', 'Licensed dataset / partner feed', 'Real time', 85, 'import', 'Dark-store locations inferred from serviceable pincodes'],
++  justdial: ['Justdial listings', 'platform', 'Licensed dataset / partner feed', 'Weekly', 55, 'import', 'Broad local-business directory'],
++  practo: ['Practo / Healthians / 1mg labs', 'platform', 'Partner feed', 'Daily', 70, 'import', 'Labs, clinics, collection centres'],
++  indiamart: ['IndiaMART supplier directory', 'platform', 'Partner feed', 'Weekly', 45, 'import', 'Hardware, building material, furniture suppliers'],
++  cult: ['Cult.fit / Gold’s Gym / Anytime Fitness centre locators', 'brand', 'Public store locator pages', 'Weekly', 70, 'import', 'Chain gym centres'],
++  evapps: ['Tata Power EZ Charge / Statiq / ChargeZone apps', 'platform', 'Operator partner APIs', 'Real time', 85, 'import', 'Live charger availability'],
++  omc: ['Oil-company outlet locators', 'brand', 'Public locator APIs', 'Weekly', 80, 'import', 'IOCL / BPCL / HPCL / Jio-bp / Nayara'],
++  brand: ['Brand store locators', 'brand', 'Public store locator pages', 'Weekly', 65, 'import', 'Official chain store lists'],
++  propertal: ['NoBroker / 99acres / MagicBricks commercial listings', 'platform', 'Licensed dataset', 'Daily', 70, 'import', 'Commercial rent & vacancy (rent layer)'],
++  cowork: ['myHQ / Awfis / WeWork / Smartworks locators', 'brand', 'Public locator pages', 'Weekly', 65, 'import', 'Co-working centres and seat counts'],
++};
++
++export const SRC = Object.fromEntries(Object.entries(LIB).map(([id, [name, type, access, refresh, realtime, integration, note]]) => [id, { id, name, type, access, refresh, realtime, integration, note }]));
++
++// key: [mapCoverage, registry, freshness, platformSignal, sources[], brandsForLocator?, note]
++const CAT = {
++  grocery: [60, 70, 70, 80, ['osm', 'gplaces', 'fssai', 'gst', 'shopact', 'qcom', 'brand'], 'D-Mart · Reliance Smart/Fresh · More · Star Bazaar', 'Chains are mapped; kiranas come from FSSAI; quick-commerce dark stores are a direct competitive pressure.'],
++  qcommerce: [25, 60, 75, 85, ['qcom', 'fssai', 'gplaces', 'osm'], 'Blinkit · Zepto · Instamart · BB Now', 'Dark stores are deliberately unmapped; FSSAI licences + serviceability data reveal them.'],
++  pharmacy: [70, 85, 75, 70, ['osm', 'gplaces', 'fda', 'gst', 'practo', 'brand'], 'Apollo · MedPlus · Wellness Forever · Noble', 'Drug licences make the FDA list near-complete.'],
++  qsr: [75, 70, 85, 90, ['osm', 'gplaces', 'swiggy', 'zomato', 'fssai', 'brand'], "McDonald's · KFC · Domino's · Burger King · Subway", 'Swiggy/Zomato show open/closed status in real time.'],
++  cafe: [70, 65, 80, 85, ['osm', 'gplaces', 'swiggy', 'zomato', 'fssai', 'brand'], 'Starbucks · Third Wave · Blue Tokai · CCD', 'Independent cafés churn fast; platforms catch it first.'],
++  fashion: [60, 45, 55, 75, ['osm', 'gplaces', 'gst', 'shopact', 'brand'], 'Zudio · Trends · Westside · Max · Pantaloons', 'Brand store locators cover organised fashion well.'],
++  mall: [90, 70, 50, 60, ['osm', 'gplaces', 'rera', 'propertal'], 'Phoenix · Pavilion · Amanora · Westend', 'Few, large and well known; RERA shows upcoming supply.'],
++  convenience: [50, 60, 60, 55, ['osm', 'gplaces', 'fssai', 'shopact', 'brand'], '24Seven · In & Out · local stores', 'Overlaps with kiranas; FSSAI is the main census.'],
++  auto: [75, 70, 60, 85, ['osm', 'gplaces', 'vahan', 'brand'], 'Maruti · Tata · Hyundai · Mahindra dealer locators', 'OEM dealer locators are complete; VAHAN gives demand per RTO.'],
++  ev: [55, 55, 75, 80, ['osm', 'ocm', 'gplaces', 'bee', 'evapps'], 'Tata Power · Statiq · ChargeZone · Jio-bp pulse', 'New chargers weekly; Open Charge Map + operator apps beat OSM.'],
++  fuel: [90, 85, 85, 90, ['osm', 'gplaces', 'peso', 'omc'], 'IOCL · BPCL · HPCL · Jio-bp · Nayara · Shell', 'Large, licensed, fixed; near-complete.'],
++  diagnostics: [55, 65, 65, 80, ['osm', 'gplaces', 'nabl', 'practo', 'brand'], 'Dr Lal · Metropolis · Thyrocare · SRL · Suburban', 'Collection centres mostly come from Practo/brand lists.'],
++  gym: [60, 40, 65, 75, ['osm', 'gplaces', 'cult', 'shopact', 'justdial'], 'Cult.fit · Gold’s Gym · Anytime Fitness · Snap Fitness', 'Chains via locators; independents via OSM/Justdial.'],
++  electronics: [65, 50, 55, 80, ['osm', 'gplaces', 'gst', 'brand'], 'Croma · Reliance Digital · Vijay Sales · brand stores', 'Organised chains publish full store lists.'],
++  mobile: [60, 45, 55, 70, ['osm', 'gplaces', 'gst', 'shopact', 'brand'], 'Apple · Samsung · Sangeetha · Poorvika · Mi', 'Brand stores listed; multi-brand shops are dense and under-mapped.'],
++  jewellery: [60, 80, 55, 75, ['osm', 'gplaces', 'bis', 'brand'], 'Tanishq · PNG · Kalyan · Malabar · Chandukaka Saraf', 'BIS hallmark registration is mandatory → strong registry.'],
++  footwear: [55, 45, 55, 75, ['osm', 'gplaces', 'gst', 'brand'], 'Bata · Metro · Campus · Liberty · Skechers', 'Brand locators carry most of the signal.'],
++  salon: [55, 40, 60, 65, ['osm', 'gplaces', 'shopact', 'justdial', 'brand'], 'Naturals · Lakmé · Jawed Habib · Enrich', 'Many small parlours; Justdial + Shop Act fill gaps.'],
++  bakery: [60, 70, 75, 80, ['osm', 'gplaces', 'swiggy', 'zomato', 'fssai', 'brand'], 'Monginis · Theobroma · Kayani · Chitale', 'FSSAI + Swiggy/Zomato cover bakeries well.'],
++  furniture: [55, 45, 50, 65, ['osm', 'gplaces', 'gst', 'indiamart', 'brand'], 'IKEA · Pepperfry · Home Centre · Durian', 'Large stores mapped; small workshops via IndiaMART.'],
++  hardware: [50, 50, 45, 55, ['osm', 'gplaces', 'gst', 'indiamart', 'justdial'], 'Local traders; IndiaMART suppliers', 'Fragmented trade; GST is the best census.'],
++  restaurant: [75, 70, 85, 90, ['osm', 'gplaces', 'swiggy', 'zomato', 'fssai'], 'Zomato/Swiggy-listed restaurants', 'Swiggy/Zomato are effectively a live census of restaurants.'],
++  warehouse: [55, 65, 45, 50, ['osm', 'gplaces', 'wdra', 'rera', 'propertal'], 'LogiPark · ESR · IndoSpace · Welspun One', 'Large sites; WDRA + MIDC allotments + broker listings.'],
++  courier: [60, 55, 60, 70, ['osm', 'gplaces', 'indiapost', 'brand'], 'India Post · Delhivery · Blue Dart · DTDC · Shadowfax', 'Carrier locators publish service points.'],
++  bank: [80, 95, 85, 85, ['osm', 'gplaces', 'rbi', 'brand'], 'SBI · HDFC · ICICI · Bank of Maharashtra · Bajaj Finance', 'RBI publishes every branch with IFSC.'],
++  coaching: [45, 35, 50, 60, ['osm', 'gplaces', 'udise', 'shopact', 'justdial', 'brand'], 'Allen · Aakash · PW Vidyapeeth · FIITJEE', 'Chains via locators; UDISE/AISHE give student demand.'],
++  dairy: [45, 65, 55, 60, ['osm', 'gplaces', 'fssai', 'brand'], 'Chitale · Gokul · Katraj · Amul parlours', 'Booths are licensed (FSSAI) but rarely mapped.'],
++  pet: [50, 35, 55, 60, ['osm', 'gplaces', 'vet', 'justdial', 'brand'], 'Supertails · Heads Up For Tails · local vets', 'Small segment; vet council + Justdial.'],
++  carwash: [50, 35, 55, 60, ['osm', 'gplaces', 'shopact', 'justdial', 'brand'], 'GoMechanic · 3M Car Care · Carnation', 'Workshops via Justdial + Shop Act.'],
++  coworking: [60, 50, 60, 80, ['osm', 'gplaces', 'cowork', 'rera', 'propertal'], 'WeWork · Awfis · Smartworks · myHQ', 'Operators publish centre lists; RERA shows new office supply.'],
++};
++
+ const HYPER = /d[\s-]?mart|reliance smart|star bazaar|spar|more megastore|big bazaar|metro cash/i;
+ const SUPER = /reliance fresh|more|spencer|nature'?s basket|dorabjee|ratnadeep|smart point|fresh/i;
++const chain = (re) => (t) => (t.brand || re.test(t.name || t.operator || '') ? 'chain' : 'independent');
+ 
++// Automatically fetched categories: OSM tags, Google Places type, brand-class sizing
+ export const LIVE = {
+   grocery: {
+-    overpass: ['nwr["shop"="supermarket"]', 'nwr["shop"="grocery"]', 'nwr["shop"="wholesale"]["wholesale"~"food|grocery"]'],
+-    registry: { name: 'FSSAI FoSCoS licence register', url: 'https://foscos.fssai.gov.in', field: 'FSSAI licence no.' },
+-    parts: { mapCoverage: 55, registry: 70, freshness: 65, brandSignal: 75 },
+-    note: 'Chains (D-Mart, Reliance, More, Star Bazaar) are well mapped; small kiranas are under-mapped, so the FSSAI register fills the gap.',
++    overpass: ['nwr["shop"="supermarket"]', 'nwr["shop"="grocery"]', 'nwr["shop"="wholesale"]["wholesale"~"food|grocery"]'], gtype: 'supermarket',
+     brandClass: (t) => (HYPER.test(t.name || t.brand || '') ? 'hypermarket' : SUPER.test(t.name || t.brand || '') || t.shop === 'supermarket' ? 'supermarket' : 'convenience'),
+     area: { hypermarket: 25000, supermarket: 6000, convenience: 1500 },
+   },
+-  pharmacy: {
+-    overpass: ['nwr["amenity"="pharmacy"]', 'nwr["shop"="chemist"]'],
+-    registry: { name: 'FDA Maharashtra retail drug licences', url: 'https://fdamfg.maharashtra.gov.in', field: 'Drug licence no. (Form 20/21)' },
+-    parts: { mapCoverage: 65, registry: 85, freshness: 70, brandSignal: 60 },
+-    note: 'Every chemist must hold a drug licence, so the FDA list is close to a complete census; OSM covers chains (Apollo, MedPlus, Wellness Forever) well.',
+-    brandClass: (t) => (/apollo|medplus|wellness forever|netmeds|truemeds|frank ross|noble/i.test(t.name || t.brand || '') ? 'chain' : 'independent'),
+-    area: { chain: 800, independent: 400 },
+-  },
+-  qsr: {
+-    overpass: ['nwr["amenity"="fast_food"]'],
+-    registry: { name: 'FSSAI FoSCoS licence register', url: 'https://foscos.fssai.gov.in', field: 'FSSAI licence no.' },
+-    parts: { mapCoverage: 70, registry: 70, freshness: 70, brandSignal: 85 },
+-    note: 'Global and national QSR brands are almost fully mapped with brand tags; street-food stalls are not.',
+-    brandClass: (t) => (t.brand || /mcdonald|kfc|domino|burger king|subway|pizza hut|wow! momo|taco bell/i.test(t.name || '') ? 'chain' : 'independent'),
+-    area: { chain: 2200, independent: 900 },
+-  },
+-  cafe: {
+-    overpass: ['nwr["amenity"="cafe"]'],
+-    registry: { name: 'FSSAI FoSCoS licence register', url: 'https://foscos.fssai.gov.in', field: 'FSSAI licence no.' },
+-    parts: { mapCoverage: 65, registry: 65, freshness: 65, brandSignal: 75 },
+-    note: 'Starbucks, Third Wave, Blue Tokai, CCD are mapped; independent cafés open and close fast, so freshness matters.',
+-    brandClass: (t) => (t.brand || /starbucks|third wave|blue tokai|cafe coffee day|ccd|costa|barista|tim hortons/i.test(t.name || '') ? 'chain' : 'independent'),
+-    area: { chain: 1500, independent: 800 },
+-  },
+-  fuel: {
+-    overpass: ['nwr["amenity"="fuel"]'],
+-    registry: { name: 'PESO licences + OMC outlet locators (IOCL/BPCL/HPCL)', url: 'https://peso.gov.in', field: 'PESO licence / outlet code' },
+-    parts: { mapCoverage: 90, registry: 85, freshness: 85, brandSignal: 95 },
+-    note: 'Fuel stations are large, fixed and licensed; OSM coverage in Pune is near-complete and brands are tagged.',
+-    brandClass: (t) => (/indian oil|iocl|bharat|bpcl|hindustan|hpcl|shell|nayara|jio-bp|reliance/i.test(t.brand || t.name || t.operator || '') ? 'omc' : 'other'),
+-    area: { omc: 16000, other: 12000 },
+-  },
+-  bank: {
+-    overpass: ['nwr["amenity"="bank"]'],
+-    registry: { name: 'RBI Bank Branch master (DBIE / IFSC list)', url: 'https://www.rbi.org.in', field: 'IFSC code' },
+-    parts: { mapCoverage: 80, registry: 95, freshness: 85, brandSignal: 90 },
+-    note: 'RBI publishes every branch with IFSC; OSM has most branches with operator tags. Highest feasibility category.',
+-    brandClass: (t) => (/state bank|sbi|hdfc|icici|axis|kotak|bank of maharashtra|bank of baroda|canara|union bank|pnb/i.test(t.name || t.brand || t.operator || '') ? 'major' : 'other'),
+-    area: { major: 2000, other: 1200 },
+-  },
+-  ev: {
+-    overpass: ['nwr["amenity"="charging_station"]'],
+-    registry: { name: 'BEE public charger list + operator apps (Tata Power EZ, Statiq, ChargeZone)', url: 'https://beeindia.gov.in', field: 'Operator station ID' },
+-    parts: { mapCoverage: 55, registry: 70, freshness: 60, brandSignal: 70 },
+-    note: 'Fast-growing network: new chargers appear weekly and OSM lags; operator lists are the better live source.',
+-    brandClass: (t) => (/dc|ccs|fast/i.test(JSON.stringify(t)) ? 'dc_fast' : 'ac'),
+-    area: { dc_fast: 1500, ac: 600 },
+-  },
+-};
+-
+-export const feasibilityOf = (key) => {
+-  const p = LIVE[key]?.parts; if (!p) return null;
+-  return Math.round(0.4 * p.mapCoverage + 0.25 * p.registry + 0.2 * p.freshness + 0.15 * p.brandSignal);
++  pharmacy: { overpass: ['nwr["amenity"="pharmacy"]', 'nwr["shop"="chemist"]'], gtype: 'pharmacy', brandClass: chain(/apollo|medplus|wellness forever|netmeds|truemeds|frank ross|noble/i), area: { chain: 800, independent: 400 } },
++  qsr: { overpass: ['nwr["amenity"="fast_food"]'], gtype: 'fast_food_restaurant', brandClass: chain(/mcdonald|kfc|domino|burger king|subway|pizza hut|wow! momo|taco bell/i), area: { chain: 2200, independent: 900 } },
++  cafe: { overpass: ['nwr["amenity"="cafe"]'], gtype: 'cafe', brandClass: chain(/starbucks|third wave|blue tokai|cafe coffee day|ccd|costa|barista|tim hortons/i), area: { chain: 1500, independent: 800 } },
++  fuel: { overpass: ['nwr["amenity"="fuel"]'], gtype: 'gas_station', brandClass: (t) => (/indian oil|iocl|bharat|bpcl|hindustan|hpcl|shell|nayara|jio-bp|reliance/i.test(t.brand || t.name || t.operator || '') ? 'omc' : 'other'), area: { omc: 16000, other: 12000 } },
++  bank: { overpass: ['nwr["amenity"="bank"]'], gtype: 'bank', brandClass: (t) => (/state bank|sbi|hdfc|icici|axis|kotak|bank of maharashtra|bank of baroda|canara|union bank|pnb/i.test(t.name || t.brand || t.operator || '') ? 'major' : 'other'), area: { major: 2000, other: 1200 } },
++  ev: { overpass: ['nwr["amenity"="charging_station"]'], gtype: 'electric_vehicle_charging_station', brandClass: (t) => (/dc|ccs|fast/i.test(JSON.stringify(t)) ? 'dc_fast' : 'ac'), area: { dc_fast: 1500, ac: 600 } },
++  restaurant: { overpass: ['nwr["amenity"="restaurant"]'], gtype: 'restaurant', brandClass: chain(/barbeque nation|mainland china|social|haldiram|vaishali|shiv sagar|chili'?s/i), area: { chain: 3500, independent: 1800 } },
++  bakery: { overpass: ['nwr["shop"="bakery"]', 'nwr["shop"="pastry"]', 'nwr["shop"="confectionery"]'], gtype: 'bakery', brandClass: chain(/monginis|theobroma|kayani|chitale|german bakery|birdy|cakezone/i), area: { chain: 900, independent: 500 } },
++  gym: { overpass: ['nwr["leisure"="fitness_centre"]', 'nwr["leisure"="sports_centre"]["sport"="fitness"]'], gtype: 'gym', brandClass: chain(/cult|gold'?s gym|anytime fitness|snap fitness|talwalkar|powerworld/i), area: { chain: 8000, independent: 4000 } },
+ };
+ 
+-export const isLive = (key) => !!LIVE[key];
+ export const LIVE_KEYS = Object.keys(LIVE);
++export const isLive = (key) => !!LIVE[key];
++
++export function catalogueOf(key) {
++  const c = CAT[key]; if (!c) return null;
++  const [mapCoverage, registry, freshness, platformSignal, srcIds, brands, note] = c;
++  const parts = { mapCoverage, registry, freshness, platformSignal };
++  const sources = srcIds.map((id) => ({ ...SRC[id], ...(id === 'brand' && brands ? { name: `Brand store locators (${brands})` } : {}) }));
++  // a live category's OSM + Google sources are integrated; other categories list everything as import/planned
++  if (!LIVE[key]) for (const s of sources) if (s.integration === 'integrated') s.integration = 'planned';
++  return { parts, sources, brands, note, feasibility: Math.round(0.4 * mapCoverage + 0.25 * registry + 0.2 * freshness + 0.15 * platformSignal) };
++}
++
++export const feasibilityOf = (key) => catalogueOf(key)?.feasibility ?? null;
++export const CATALOGUE_KEYS = Object.keys(CAT);
+diff --git a/server/src/models/index.js b/server/src/models/index.js
+index 87a3b4e..778a674 100644
+--- a/server/src/models/index.js
++++ b/server/src/models/index.js
+@@ -75,7 +75,8 @@ const PoiSchema = new Schema({
+   osmId: String, name: String, category: { type: String, index: true }, brandClass: String, areaSqft: Number,
+   loc: Point, h3: { type: String, index: true }, locality: String,
+   // live data: where the record came from and whether it still exists
+-  source: { type: String, enum: ['simulated', 'osm', 'registry', 'osm+registry'], default: 'simulated' },
++  source: { type: String, default: 'simulated' }, // simulated | osm | gplaces | ocm | registry | platform | multi
++  sources: [String], platforms: [String], // every connector / platform that confirmed this business
+   brand: String, regNo: String,
+   status: { type: String, enum: ['open', 'closed'], default: 'open', index: true },
+   closedReason: String, // NOT_IN_LATEST_OSM | REGISTRY_CANCELLED | USER_REPORTED | WHAT_IF
+@@ -137,5 +138,6 @@ const LiveSyncSchema = new Schema({
+   category: { type: String, index: true }, ok: Boolean, error: String, durationMs: Number,
+   fetched: Number, osm: Number, registry: Number, both: Number, open: Number,
+   added: Number, closed: Number, reopened: Number, nameCoverage: Number, feasibility: Number,
++  bySource: Schema.Types.Mixed, warnings: [String],
+ }, { timestamps: true, versionKey: false });
+ export const LiveSync = model('LiveSync', LiveSyncSchema, 'live_syncs');
+diff --git a/server/src/routes/core.js b/server/src/routes/core.js
+index 8af1052..a7f3519 100644
+--- a/server/src/routes/core.js
++++ b/server/src/routes/core.js
+@@ -46,8 +46,9 @@ r.get('/meta', asyncH(async (req, res) => {
+   res.json({
+     modelVersion: config.modelVersion, mlMode: ml.health().mode, llm: config.llmUrl ? 'llm' : 'template',
+     sources: [
+-      { name: 'OpenStreetMap (live, Overpass API)', detail: `Competitor POIs refreshed every ${process.env.LIVE_REFRESH_HOURS || 12} h for ${LIVE_KEYS.length} categories`, licence: 'ODbL', kind: 'real', note: 'Other categories still use the simulated extract' },
+-      { name: 'Official registries', detail: 'FSSAI, FDA Maharashtra, RBI branch master, PESO/OMC, EV operators', licence: 'Public records', kind: 'real', note: 'Adds registered businesses missing from the map; cancelled licences remove them' },
++      { name: 'OpenStreetMap (live, Overpass API)', detail: `Competitor POIs refreshed every ${process.env.LIVE_REFRESH_HOURS || 12} h for ${LIVE_KEYS.length} categories (+ Google Places / Open Charge Map when keys are set)`, licence: 'ODbL', kind: 'real', note: 'Other categories still use the simulated extract' },
++      { name: 'Government registrations', detail: 'FSSAI, FDA, RBI/IFSC, PESO, BIS, NABL, GST, Shop Act, VAHAN, MahaRERA', licence: 'Public records', kind: 'real', note: 'Adds registered businesses missing from the map; cancelled licences remove them' },
++      { name: 'Industry platforms & brand locators', detail: 'Swiggy, Zomato, Blinkit/Zepto, Practo, Cult.fit, OEM & chain store locators', licence: 'Partner feed / licensed', kind: 'real', note: 'Imported via platform feeds; delisted outlets are marked closed' },
+       { name: 'WorldPop 100 m', detail: 'Population 2015 + 2020', licence: 'CC BY 4.0', kind: 'real', note: 'Seeded demo uses synthesised population' },
+       { name: 'Store revenue, rent, margins', detail: 'Seeded simulator (variant A train, B shift test)', licence: '—', kind: 'simulated' },
+       { name: 'Your uploads', detail: `${await Store.countDocuments({ chain: 'own', ...(req.user ? { owner: req.user._id } : {}) })} stores · ${outcomes} outcomes recorded`, licence: 'Yours', kind: 'yours' },
+@@ -735,6 +736,8 @@ r.get('/shops', asyncH(async (req, res) => {
+       brandClass: q.brandClass || (isOwn ? 'Own Network' : 'Standard'),
+       areaSqft: q.areaSqft || 2500,
+       source: q.source || (isOwn ? 'own' : 'simulated'),
++      sources: q.sources || [],
++      platforms: q.platforms || [],
+       isCompetitor: isComp,
+     };
+   };
+diff --git a/server/src/routes/live.js b/server/src/routes/live.js
+index 74e9be8..6fb9d19 100644
+--- a/server/src/routes/live.js
++++ b/server/src/routes/live.js
+@@ -1,55 +1,70 @@
+-// Live data API: feasibility + sync status (Trust Center), manual refresh, registry upload, what-if closures.
++// Live data API: feasibility + source catalogue for all 30 categories (Trust Center), sync status,
++// manual refresh, registry / platform feed upload, what-if closures.
+ import { Router } from 'express';
+ import { z } from 'zod';
+ import { optionalAuth, requireAuth, validate } from '../middleware/index.js';
+ import { asyncH, bad, notFound } from '../utils/index.js';
+ import { Poi, LiveSync } from '../models/index.js';
+ import { catByKey, CATEGORIES } from '../data/categories.js';
+-import { LIVE, LIVE_KEYS, feasibilityOf } from '../data/liveSources.js';
+-import { syncCategory, syncAll, setCompetitorStatus } from '../services/liveData.js';
++import { LIVE, LIVE_KEYS, catalogueOf } from '../data/liveSources.js';
++import { syncCategory, syncAll, setCompetitorStatus, connectorStatus } from '../services/liveData.js';
+ 
+ const r = Router();
+ r.use(optionalAuth);
+ 
+-async function statusOf(key) {
+-  const spec = LIVE[key];
+-  const [last, lastOk, bySource, closed] = await Promise.all([
++async function statusOf(key, detail) {
++  const cat = catalogueOf(key);
++  const base = { key, name: catByKey[key]?.name, icon: catByKey[key]?.icon, group: catByKey[key]?.group, live: !!LIVE[key], feasibility: cat?.feasibility ?? null };
++  const lastOk = LIVE[key] ? await LiveSync.findOne({ category: key, ok: true }).sort({ createdAt: -1 }).select('createdAt open').lean() : null;
++  base.mode = lastOk ? 'live' : 'simulated';
++  base.lastSuccessAt = lastOk?.createdAt || null;
++  base.liveOutlets = lastOk?.open ?? null;
++  if (!detail) return base;
++
++  const [last, bySource, closed] = await Promise.all([
+     LiveSync.findOne({ category: key }).sort({ createdAt: -1 }).lean(),
+-    LiveSync.findOne({ category: key, ok: true }).sort({ createdAt: -1 }).lean(),
+-    Poi.aggregate([{ $match: { category: key, status: { $ne: 'closed' } } }, { $group: { _id: '$source', n: { $sum: 1 } } }]),
++    Poi.aggregate([{ $match: { category: key, status: { $ne: 'closed' } } }, { $unwind: { path: '$sources', preserveNullAndEmptyArrays: true } }, { $group: { _id: { $ifNull: ['$sources', '$source'] }, n: { $sum: 1 } } }]),
+     Poi.aggregate([{ $match: { category: key, status: 'closed' } }, { $group: { _id: '$closedReason', n: { $sum: 1 } } }]),
+   ]);
+-  const src = Object.fromEntries(bySource.map((x) => [x._id || 'simulated', x.n]));
+-  const live = (src.osm || 0) + (src.registry || 0) + (src['osm+registry'] || 0);
++  const counts = Object.fromEntries(bySource.map((x) => [x._id || 'simulated', x.n]));
++  const conn = LIVE[key] ? connectorStatus(key) : {};
++  const connectorFor = (s) => (['osm', 'gplaces', 'ocm'].includes(s.id) ? s.id : s.type === 'govt' ? 'registry' : 'platform');
+   return {
+-    key, name: catByKey[key]?.name, icon: catByKey[key]?.icon, live: !!spec,
+-    feasibility: spec ? feasibilityOf(key) : null, parts: spec?.parts || null, note: spec?.note || null,
+-    sources: spec ? [{ name: 'OpenStreetMap (Overpass API)', kind: 'map', refresh: `every ${process.env.LIVE_REFRESH_HOURS || 12} h` }, { ...spec.registry, kind: 'registry' }] : [],
+-    mode: live > 0 ? 'live' : 'simulated',
+-    counts: { ...src, live, closed: Object.fromEntries(closed.map((x) => [x._id || 'UNKNOWN', x.n])) },
+-    lastSync: last ? { at: last.createdAt, ok: last.ok, error: last.error, added: last.added, closed: last.closed, reopened: last.reopened, nameCoverage: last.nameCoverage } : null,
+-    lastSuccessAt: lastOk?.createdAt || null,
++    ...base, parts: cat.parts, note: cat.note, brands: cat.brands,
++    sources: cat.sources.map((s) => {
++      const c = connectorFor(s);
++      const connected = !!LIVE[key] && !!conn[c];
++      return { ...s, connector: c, connected, records: connected ? counts[c] || 0 : 0 };
++    }),
++    counts: { ...counts, closed: Object.fromEntries(closed.map((x) => [x._id || 'UNKNOWN', x.n])) },
++    lastSync: last ? { at: last.createdAt, ok: last.ok, error: last.error, warnings: last.warnings, added: last.added, closed: last.closed, reopened: last.reopened, nameCoverage: last.nameCoverage, bySource: last.bySource } : null,
+   };
+ }
+ 
++// ?category=key → full detail for one; otherwise a summary for all 30
+ r.get('/status', asyncH(async (req, res) => {
+-  const keys = req.query.category ? [String(req.query.category)] : LIVE_KEYS;
+-  const out = await Promise.all(keys.filter((k) => catByKey[k]).map(statusOf));
+-  res.json({ categories: out, liveKeys: LIVE_KEYS, simulatedKeys: CATEGORIES.map((c) => c.key).filter((k) => !LIVE[k]) });
++  const k = req.query.category && catByKey[req.query.category] ? String(req.query.category) : null;
++  const categories = await Promise.all((k ? [k] : CATEGORIES.map((c) => c.key)).map((key) => statusOf(key, !!k)));
++  res.json({ categories, liveKeys: LIVE_KEYS });
+ }));
+ 
+ r.post('/refresh', requireAuth, asyncH(async (req, res) => {
+   const k = req.query.category ? String(req.query.category) : null;
+-  if (k && !LIVE[k]) throw bad(`${k} has no live source yet`, 'category');
+-  const results = k ? [await syncCategory(k)] : await syncAll();
+-  res.json({ results });
++  if (k && !LIVE[k]) throw bad(`${k} has no automatic live source yet`, 'category');
++  res.json({ results: k ? [await syncCategory(k)] : await syncAll() });
+ }));
+ 
+-const regSchema = z.object({ rows: z.array(z.object({ name: z.string().min(1), lat: z.coerce.number(), lon: z.coerce.number(), regNo: z.string().optional(), status: z.string().optional() })).min(1).max(5000) });
+-r.post('/registry/:category', requireAuth, validate(regSchema), asyncH(async (req, res) => {
+-  const k = req.params.category;
+-  if (!LIVE[k]) throw bad(`${k} has no live source yet`, 'category');
+-  res.json({ result: await syncCategory(k, { extraRegistry: req.body.rows }) });
++const rowSchema = z.object({ name: z.string().min(1), lat: z.coerce.number(), lon: z.coerce.number(), regNo: z.string().optional(), status: z.string().optional(), platform: z.string().optional(), id: z.union([z.string(), z.number()]).optional() });
++const rowsSchema = z.object({ rows: z.array(rowSchema).min(1).max(5000) });
++// government registrations (FSSAI, FDA, RBI, PESO, BIS, NABL, GST, Shop Act …)
++r.post('/registry/:category', requireAuth, validate(rowsSchema), asyncH(async (req, res) => {
++  if (!LIVE[req.params.category]) throw bad(`${req.params.category} has no live source yet`, 'category');
++  res.json({ result: await syncCategory(req.params.category, { extraRegistry: req.body.rows }) });
++}));
++// industry platforms & brand locators (Swiggy, Zomato, Blinkit, Practo, Cult.fit, OEM locators …)
++r.post('/platform/:category', requireAuth, validate(rowsSchema), asyncH(async (req, res) => {
++  if (!LIVE[req.params.category]) throw bad(`${req.params.category} has no live source yet`, 'category');
++  res.json({ result: await syncCategory(req.params.category, { extraPlatform: req.body.rows }) });
+ }));
+ 
+ // What-if: "this competitor does not exist" → every score, hexagon and recommendation recomputes
+diff --git a/server/src/scripts/seed.js b/server/src/scripts/seed.js
+index 73c58d7..69e7246 100644
+--- a/server/src/scripts/seed.js
++++ b/server/src/scripts/seed.js
+@@ -35,7 +35,7 @@ async function main() {
+   const keepUsers = process.argv.includes('--keep-users');
+   await mongoose.connect(config.mongoUri);
+   console.log('Connected', config.mongoUri);
+-  await Promise.all([Cell.deleteMany({}), Poi.deleteMany({ source: { $nin: ['osm', 'registry', 'osm+registry'] } }), CategoryProfile.deleteMany({}), MlModel.deleteMany({}), Score.deleteMany({}), SearchLog.deleteMany({}), Store.deleteMany({ chain: 'sim' })]);
++  await Promise.all([Cell.deleteMany({}), Poi.deleteMany({ $or: [{ source: 'simulated' }, { source: { $exists: false } }] }), CategoryProfile.deleteMany({}), MlModel.deleteMany({}), Score.deleteMany({}), SearchLog.deleteMany({}), Store.deleteMany({ chain: 'sim' })]);
+   if (!keepUsers) await Promise.all([User.deleteMany({}), Store.deleteMany({}), Saved.deleteMany({}), Feedback.deleteMany({}), Outcome.deleteMany({})]);
+ 
+   // ---------- 1. grid + features
+@@ -111,7 +111,7 @@ async function main() {
+   const wsum = weights.reduce((a, b) => a + b, 0);
+   const pick = () => { let x = R() * wsum; for (let i = 0; i < raw.length; i++) { x -= weights[i]; if (x <= 0) return raw[i]; } return raw[raw.length - 1]; };
+   const pois = [];
+-  const liveCats = new Set(await Poi.distinct('category', { source: { $in: ['osm', 'registry', 'osm+registry'] } }));
++  const liveCats = new Set(await Poi.distinct('category', { source: { $exists: true, $ne: 'simulated' } }));
+   for (const cat of CATEGORIES) {
+     if (liveCats.has(cat.key)) continue; // real data already ingested for this category
+     const n = COUNT[cat.key] || 30;
+diff --git a/server/src/services/liveData.js b/server/src/services/liveData.js
+index d32f8be..13f9a12 100644
+--- a/server/src/services/liveData.js
++++ b/server/src/services/liveData.js
+@@ -1,15 +1,20 @@
+ /**
+- * Live competitor data: OpenStreetMap (Overpass) + official registries → `competitors` collection.
++ * Live competitor data → `competitors` collection.
+  *
+- * Each sync, per live category:
+- *   1. fetch every matching OSM node/way/relation inside the Pune & PCMC polygon
+- *   2. merge registry rows (offline businesses not on the map); dedupe within 60 m by name
+- *   3. upsert: new → added (status open); seen again → lastSeen updated / reopened
+- *   4. a POI from a previous live sync that is no longer returned → status closed (NOT_IN_LATEST_OSM)
+- *      a registry row with status closed/cancelled → matching POI closed (REGISTRY_CANCELLED)
+- *   5. simulated POIs of that category are removed once a live sync succeeds
+- *   6. reload the in-memory state → catchments, hexagon scores, recommendations, portfolio all recompute
+- * If Overpass is down, the category keeps its previous data and the failure is logged.
++ * Connectors (per live category, every LIVE_REFRESH_HOURS):
++ *   osm       OpenStreetMap Overpass                    always on (free)
++ *   gplaces   Google Places API (New) searchText        when GOOGLE_PLACES_KEY is set; businessStatus → closures
++ *   ocm       Open Charge Map                           EV only; OCM_API_KEY recommended; IsOperational → closures
++ *   registry  government registers (FSSAI, FDA, RBI, PESO, BIS, NABL, GST, Shop Act…)
++ *             server/data/registry/<key>.csv  or  POST /api/live/registry/:category
++ *   platform  industry platforms & brand locators (Swiggy, Zomato, Blinkit, Practo, Cult.fit, OEM locators…)
++ *             server/data/platform/<key>.json|csv, PLATFORM_FEED_URLS={"restaurant":"https://…"}  or  POST /api/live/platform/:category
++ *
++ * Merge: records within 60 m with a matching name are one business; each keeps the list of sources that saw it.
++ * Closures: OSM-only record missing from the latest pull → NOT_IN_LATEST_OSM; registry cancelled → REGISTRY_CANCELLED;
++ *   Google CLOSED_* → GOOGLE_CLOSED; platform delisted/closed → PLATFORM_DELISTED; charger not operational → OCM_NON_OPERATIONAL.
++ * Simulated POIs of a category are removed only after a successful live pull; failures keep previous data.
++ * After a sync, Node state + caches reload and the Python ML service is told to reload → the whole app recomputes.
+  */
+ import fs from 'fs';
+ import path from 'path';
+@@ -25,8 +30,10 @@ import { config } from '../config/index.js';
+ import { clearAll } from './cache.js';
+ 
+ const __dirname = path.dirname(fileURLToPath(import.meta.url));
+-const REGISTRY_DIR = path.resolve(__dirname, '../../data/registry');
++const DATA_DIR = path.resolve(__dirname, '../../data');
+ const ENDPOINTS = (process.env.OVERPASS_URLS || 'https://overpass-api.de/api/interpreter,https://overpass.kumi.systems/api/interpreter').split(',').map((s) => s.trim());
++const AUTO_CLOSE = ['NOT_IN_LATEST_OSM', 'REGISTRY_CANCELLED', 'GOOGLE_CLOSED', 'PLATFORM_DELISTED', 'OCM_NON_OPERATIONAL'];
++const CLOSED_RE = /closed|cancel|suspend|revok|surrender|delist|unservice|inactive|struck|non[-_ ]?operational/i;
+ 
+ const nearestLocality = (lat, lon) => {
+   let best = null, bd = Infinity;
+@@ -36,85 +43,150 @@ const nearestLocality = (lat, lon) => {
+ const norm = (s = '') => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+ const sameName = (a, b) => { const x = norm(a), y = norm(b); return !!x && !!y && (x.includes(y) || y.includes(x)); };
+ 
+-export function overpassQuery(key) {
+-  const { s, w, n, e } = PUNE_BBOX;
+-  const parts = LIVE[key].overpass.map((q) => `${q}(${s},${w},${n},${e});`).join('');
+-  return `[out:json][timeout:60];(${parts});out center tags;`;
+-}
+-
+ let fetchImpl = (...a) => fetch(...a);
+ export const _setFetch = (f) => { fetchImpl = f; }; // tests
+ 
++async function getJson(url, opts = {}, ms = 70000) {
++  const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), ms);
++  try {
++    const r = await fetchImpl(url, { ...opts, signal: ctrl.signal });
++    if (!r.ok) throw new Error(`HTTP ${r.status} from ${new URL(url).host}`);
++    return await r.json();
++  } finally { clearTimeout(t); }
++}
++
++// ---------------- connector: OpenStreetMap
++export function overpassQuery(key) {
++  const { s, w, n, e } = PUNE_BBOX;
++  return `[out:json][timeout:60];(${LIVE[key].overpass.map((q) => `${q}(${s},${w},${n},${e});`).join('')});out center tags;`;
++}
+ async function fetchOverpass(key) {
+   const body = 'data=' + encodeURIComponent(overpassQuery(key));
+   let lastErr;
+   for (const url of ENDPOINTS) {
+-    const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), 70000);
+-    try {
+-      const r = await fetchImpl(url, { method: 'POST', body, signal: ctrl.signal, headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'Karyakshetram/1.0 (site selection research)' } });
+-      if (!r.ok) throw new Error(`Overpass HTTP ${r.status}`);
+-      const j = await r.json();
+-      return j.elements || [];
+-    } catch (e) { lastErr = e; } finally { clearTimeout(t); }
++    try { return (await getJson(url, { method: 'POST', body, headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'Karyakshetram/1.0 (site selection research)' } })).elements || []; } catch (e) { lastErr = e; }
+   }
+   throw lastErr || new Error('Overpass unreachable');
+ }
+-
+ export function fromOsm(key, el) {
+   const lat = el.lat ?? el.center?.lat, lon = el.lon ?? el.center?.lon;
+   if (lat == null || lon == null || !insideCity(lat, lon, CITY.polygon)) return null;
+   const t = el.tags || {};
+-  const spec = LIVE[key];
+-  const brandClass = spec.brandClass(t);
+-  return {
+-    osmId: `${el.type}/${el.id}`, name: t.name || t.brand || t.operator || null, brand: t.brand || t.operator || undefined,
+-    category: key, brandClass, areaSqft: spec.area[brandClass] || 1500, lat, lon, source: 'osm',
+-  };
++  const brandClass = LIVE[key].brandClass(t);
++  return { osmId: `${el.type}/${el.id}`, name: t.name || t.brand || t.operator || null, brand: t.brand || t.operator || undefined, category: key, brandClass, areaSqft: LIVE[key].area[brandClass] || 1500, lat, lon, sources: ['osm'] };
+ }
+ 
+-export function readRegistry(key) {
+-  const f = path.join(REGISTRY_DIR, `${key}.csv`);
+-  if (!fs.existsSync(f)) return [];
+-  const rows = parse(fs.readFileSync(f), { columns: true, skip_empty_lines: true, trim: true });
+-  return normaliseRegistry(key, rows);
++// ---------------- connector: Google Places API (New) – tiles the city so each request stays under the 60-result cap
++export async function fetchGooglePlaces(key) {
++  const apiKey = process.env.GOOGLE_PLACES_KEY;
++  if (!apiKey || !LIVE[key].gtype) return null;
++  const n = Math.max(1, Math.min(6, Number(process.env.GOOGLE_PLACES_TILES || 3)));
++  const { s, w, n: north, e } = PUNE_BBOX;
++  const dLat = (north - s) / n, dLon = (e - w) / n;
++  const out = [];
++  for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
++    let pageToken;
++    for (let page = 0; page < 3; page++) {
++      const body = {
++        textQuery: LIVE[key].gtype.replace(/_/g, ' '), includedType: LIVE[key].gtype, strictTypeFiltering: true, pageSize: 20, ...(pageToken ? { pageToken } : {}),
++        locationRestriction: { rectangle: { low: { latitude: s + i * dLat, longitude: w + j * dLon }, high: { latitude: s + (i + 1) * dLat, longitude: w + (j + 1) * dLon } } },
++      };
++      const j2 = await getJson('https://places.googleapis.com/v1/places:searchText', {
++        method: 'POST', body: JSON.stringify(body),
++        headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': apiKey, 'X-Goog-FieldMask': 'places.id,places.displayName,places.location,places.businessStatus,nextPageToken' },
++      }, 20000);
++      for (const p of j2.places || []) out.push({ extId: `g/${p.id}`, name: p.displayName?.text, lat: p.location?.latitude, lon: p.location?.longitude, closed: !!p.businessStatus && p.businessStatus !== 'OPERATIONAL', kind: 'gplaces' });
++      pageToken = j2.nextPageToken; if (!pageToken) break;
++    }
++  }
++  return out;
+ }
+ 
+-/** rows: [{name, lat, lon, regNo?, status?}] – status closed|cancelled|suspended removes the business */
+-export function normaliseRegistry(key, rows) {
+-  return rows.map((r) => ({
+-    name: r.name, lat: Number(r.lat), lon: Number(r.lon), regNo: r.regNo || r.reg_no || r.licence || undefined,
+-    closed: /closed|cancel|suspend|revok|surrender/i.test(r.status || ''),
++// ---------------- connector: Open Charge Map (EV)
++export async function fetchOpenChargeMap(key) {
++  if (key !== 'ev') return null;
++  const { s, w, n, e } = PUNE_BBOX;
++  const url = `https://api.openchargemap.io/v3/poi/?output=json&countrycode=IN&maxresults=2000&compact=true&verbose=false&boundingbox=(${s},${w}),(${n},${e})${process.env.OCM_API_KEY ? `&key=${process.env.OCM_API_KEY}` : ''}`;
++  const rows = await getJson(url, { headers: { 'User-Agent': 'Karyakshetram/1.0' } }, 30000);
++  return rows.map((r) => ({ extId: `ocm/${r.ID}`, name: r.AddressInfo?.Title, lat: r.AddressInfo?.Latitude, lon: r.AddressInfo?.Longitude, closed: r.StatusType ? r.StatusType.IsOperational === false : false, kind: 'ocm' }));
++}
++
++// ---------------- connectors: government registry + platform feeds (files, env URLs, POSTed rows)
++function readTable(file) {
++  if (!fs.existsSync(file)) return [];
++  const raw = fs.readFileSync(file);
++  return file.endsWith('.json') ? JSON.parse(raw) : parse(raw, { columns: true, skip_empty_lines: true, trim: true });
++}
++/** rows: [{name, lat, lon, regNo?, status?, platform?, id?}] */
++export function normaliseRows(rows, kind) {
++  return (rows || []).map((r) => ({
++    name: r.name, lat: Number(r.lat ?? r.latitude), lon: Number(r.lon ?? r.lng ?? r.longitude), regNo: r.regNo || r.reg_no || r.licence || r.gstin || r.ifsc || undefined,
++    platform: r.platform || r.source || undefined, extId: r.id ? `${kind}/${r.platform || ''}/${r.id}` : undefined,
++    closed: CLOSED_RE.test(r.status || ''), kind,
+   })).filter((r) => r.name && Number.isFinite(r.lat) && Number.isFinite(r.lon) && insideCity(r.lat, r.lon, CITY.polygon));
+ }
++export const normaliseRegistry = (key, rows) => normaliseRows(rows, 'registry'); // backwards compatible
++export function readRegistry(key) {
++  return normaliseRows([...readTable(path.join(DATA_DIR, 'registry', `${key}.csv`)), ...readTable(path.join(DATA_DIR, 'registry', `${key}.json`))], 'registry');
++}
++async function readPlatform(key) {
++  const rows = [...readTable(path.join(DATA_DIR, 'platform', `${key}.json`)), ...readTable(path.join(DATA_DIR, 'platform', `${key}.csv`))];
++  const urls = feedUrls();
++  for (const u of [].concat(urls[key] || [])) {
++    try { const j = await getJson(u, { headers: process.env.PLATFORM_FEED_TOKEN ? { Authorization: `Bearer ${process.env.PLATFORM_FEED_TOKEN}` } : {} }, 30000); rows.push(...(Array.isArray(j) ? j : j.rows || j.data || [])); } catch (e) { console.warn('[live] platform feed failed', key, e.message); }
++  }
++  return normaliseRows(rows, 'platform');
++}
++const feedUrls = () => { try { return JSON.parse(process.env.PLATFORM_FEED_URLS || '{}'); } catch { return {}; } };
++export const connectorStatus = (key) => ({
++  osm: true,
++  gplaces: !!process.env.GOOGLE_PLACES_KEY && !!LIVE[key]?.gtype,
++  ocm: key === 'ev',
++  registry: fs.existsSync(path.join(DATA_DIR, 'registry', `${key}.csv`)) || fs.existsSync(path.join(DATA_DIR, 'registry', `${key}.json`)),
++  platform: fs.existsSync(path.join(DATA_DIR, 'platform', `${key}.json`)) || fs.existsSync(path.join(DATA_DIR, 'platform', `${key}.csv`)) || feedUrls()[key] != null,
++});
+ 
+-/** Merge OSM + registry into one list of live records and a list of registry closures */
+-export function mergeSources(key, osm, registry) {
++const REASON = { registry: 'REGISTRY_CANCELLED', gplaces: 'GOOGLE_CLOSED', platform: 'PLATFORM_DELISTED', ocm: 'OCM_NON_OPERATIONAL' };
++
++/** Merge OSM records with rows from other connectors. Returns live records + closures (with reasons). */
++export function mergeAll(key, osm, extras) {
+   const spec = LIVE[key];
+-  const out = osm.map((p) => ({ ...p }));
++  const out = osm.map((p) => ({ ...p, sources: [...(p.sources || ['osm'])] }));
+   const closures = [];
+-  for (const r of registry) {
++  for (const r of extras) {
+     const match = out.find((p) => distKm(p.lat, p.lon, r.lat, r.lon) <= 0.06 && (sameName(p.name, r.name) || !p.name));
+-    if (r.closed) { closures.push({ ...r, match }); if (match) match._closed = true; continue; }
+-    if (match) { match.source = 'osm+registry'; match.regNo = r.regNo; if (!match.name) match.name = r.name; continue; }
++    if (r.closed) { closures.push({ ...r, match, reason: REASON[r.kind] }); if (match) match._closed = REASON[r.kind]; continue; }
++    if (match) {
++      if (!match.sources.includes(r.kind)) match.sources.push(r.kind);
++      if (r.regNo) match.regNo = r.regNo; if (r.platform) match.platforms = [...new Set([...(match.platforms || []), r.platform])];
++      if (!match.name) match.name = r.name; continue;
++    }
+     const brandClass = spec.brandClass({ name: r.name });
+-    out.push({ osmId: `reg/${key}/${r.regNo || norm(r.name) + '@' + r.lat.toFixed(4)}`, name: r.name, category: key, brandClass, areaSqft: spec.area[brandClass] || 1500, lat: r.lat, lon: r.lon, source: 'registry', regNo: r.regNo });
++    out.push({ osmId: r.extId || `${r.kind}/${key}/${r.regNo || norm(r.name) + '@' + r.lat.toFixed(4)}`, name: r.name, category: key, brandClass, areaSqft: spec.area[brandClass] || 1500, lat: r.lat, lon: r.lon, sources: [r.kind], regNo: r.regNo, platforms: r.platform ? [r.platform] : undefined });
+   }
+   return { records: out.filter((p) => !p._closed), closures };
+ }
++export const mergeSources = (key, osm, registry) => mergeAll(key, osm, registry); // backwards compatible
+ 
++const primary = (srcs) => (srcs.includes('osm') && srcs.length === 1 ? 'osm' : srcs.length > 1 ? 'multi' : srcs[0]);
+ const running = new Set();
+ 
+-export async function syncCategory(key, { extraRegistry = [], reload = true } = {}) {
++export async function syncCategory(key, { extraRegistry = [], extraPlatform = [], reload = true } = {}) {
+   if (!LIVE[key]) throw new Error(`${key} is not a live category`);
+   if (running.has(key)) return { category: key, skipped: 'already running' };
+   running.add(key);
+   const t0 = Date.now();
++  const warnings = [];
+   try {
+     const elements = await fetchOverpass(key);
+     const osm = elements.map((el) => fromOsm(key, el)).filter(Boolean);
+-    const registry = [...readRegistry(key), ...normaliseRegistry(key, extraRegistry)];
+-    const { records, closures } = mergeSources(key, osm, registry);
+-    if (!records.length) throw new Error('Live source returned 0 records; keeping previous data');
++    const extras = [];
++    for (const [name, fn] of [['gplaces', fetchGooglePlaces], ['ocm', fetchOpenChargeMap]]) {
++      try { const rows = await fn(key); if (rows) extras.push(...rows.filter((r) => r.name && Number.isFinite(r.lat) && Number.isFinite(r.lon) && insideCity(r.lat, r.lon, CITY.polygon))); } catch (e) { warnings.push(`${name}: ${e.message}`); }
++    }
++    extras.push(...readRegistry(key), ...normaliseRows(extraRegistry, 'registry'), ...(await readPlatform(key)), ...normaliseRows(extraPlatform, 'platform'));
++    const { records, closures } = mergeAll(key, osm, extras);
++    if (!records.length) throw new Error('Live sources returned 0 records; keeping previous data');
+ 
+     const now = new Date();
+     const existing = await Poi.find({ category: key, source: { $ne: 'simulated' } }).lean();
+@@ -125,36 +197,36 @@ export async function syncCategory(key, { extraRegistry = [], reload = true } =
+     for (const p of records) {
+       seen.add(p.osmId);
+       const prev = byId.get(p.osmId);
+-      const name = p.name || `${key} outlet`;
+       const set = {
+-        name, brand: p.brand, category: key, brandClass: p.brandClass, areaSqft: p.areaSqft, source: p.source, regNo: p.regNo,
++        name: p.name || `${key} outlet`, brand: p.brand, category: key, brandClass: p.brandClass, areaSqft: p.areaSqft, source: primary(p.sources), sources: p.sources, platforms: p.platforms, regNo: p.regNo,
+         loc: { type: 'Point', coordinates: [p.lon, p.lat] }, h3: latLngToCell(p.lat, p.lon, 8), locality: nearestLocality(p.lat, p.lon), lastSeen: now,
+       };
+       if (!prev) { added++; Object.assign(set, { status: 'open', firstSeen: now, statusChangedAt: now }); }
+-      // closed automatically (vanished/cancelled) but back in the data → reopen; user/what-if closures stay until undone
+-      else if (prev.status === 'closed' && ['NOT_IN_LATEST_OSM', 'REGISTRY_CANCELLED'].includes(prev.closedReason)) { reopened++; Object.assign(set, { status: 'open', closedReason: null, statusChangedAt: now }); }
++      // closed automatically but back in the data → reopen; user/what-if closures stay until undone
++      else if (prev.status === 'closed' && AUTO_CLOSE.includes(prev.closedReason)) { reopened++; Object.assign(set, { status: 'open', closedReason: null, statusChangedAt: now }); }
+       ops.push({ updateOne: { filter: { osmId: p.osmId }, update: { $set: set }, upsert: true } });
+     }
+-    // vanished from the live sources → no longer exists
+-    // only map-only records can "vanish"; registry-backed businesses close via a registry cancellation
++    // only map-only records can "vanish"; records backed by a registry/platform/API close via that source's status
+     const vanished = existing.filter((p) => !seen.has(p.osmId) && p.status === 'open' && p.source === 'osm');
+     for (const p of vanished) ops.push({ updateOne: { filter: { _id: p._id }, update: { $set: { status: 'closed', closedReason: 'NOT_IN_LATEST_OSM', statusChangedAt: now } } } });
+-    for (const c of closures) if (c.match) ops.push({ updateOne: { filter: { osmId: c.match.osmId }, update: { $set: { status: 'closed', closedReason: 'REGISTRY_CANCELLED', statusChangedAt: now } } } });
++    const closedNow = closures.filter((c) => byId.has(c.match?.osmId) || byId.has(c.extId)); // only businesses we already knew about
++    for (const c of closedNow) ops.push({ updateOne: { filter: { osmId: c.match?.osmId || c.extId }, update: { $set: { status: 'closed', closedReason: c.reason, statusChangedAt: now } } } });
+     if (ops.length) await Poi.bulkWrite(ops, { ordered: false });
+     await Poi.deleteMany({ category: key, source: 'simulated' });
+ 
+-    const counts = { osm: 0, registry: 0, both: 0 };
+-    for (const p of records) counts[p.source === 'osm+registry' ? 'both' : p.source]++;
++    const bySource = {};
++    for (const p of records) for (const s of p.sources) bySource[s] = (bySource[s] || 0) + 1;
+     const nameCoverage = Math.round((osm.filter((p) => p.name).length / Math.max(1, osm.length)) * 100);
+     const log = await LiveSync.create({
+-      category: key, ok: true, durationMs: Date.now() - t0, fetched: elements.length, ...counts,
++      category: key, ok: true, durationMs: Date.now() - t0, fetched: elements.length + extras.length,
++      osm: bySource.osm || 0, registry: bySource.registry || 0, both: records.filter((p) => p.sources.length > 1).length, bySource, warnings,
+       open: await Poi.countDocuments({ category: key, status: 'open' }), added, reopened,
+-      closed: vanished.length + closures.filter((c) => c.match).length, nameCoverage, feasibility: feasibilityOf(key),
++      closed: vanished.length + closedNow.length, nameCoverage, feasibility: feasibilityOf(key),
+     });
+     if (reload) await reloadEverywhere();
+     return log.toObject();
+   } catch (e) {
+-    await LiveSync.create({ category: key, ok: false, error: String(e.message || e), durationMs: Date.now() - t0, feasibility: feasibilityOf(key) }).catch(() => {});
++    await LiveSync.create({ category: key, ok: false, error: String(e.message || e), warnings, durationMs: Date.now() - t0, feasibility: feasibilityOf(key) }).catch(() => {});
+     return { category: key, ok: false, error: String(e.message || e) };
+   } finally { running.delete(key); }
+ }
+-- 
+2.43.0
+

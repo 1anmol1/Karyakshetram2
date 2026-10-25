@@ -1,0 +1,17 @@
+{
+  "name": "karyakshetram",
+  "private": true,
+  "description": "Karyakshetram — retail expansion intelligence (MERN). Run `npm run setup`, then `npm run seed`, then `npm run dev:server` and `npm run dev:client` in two terminals.",
+  "scripts": {
+    "setup": "npm --prefix server install && npm --prefix client install",
+    "seed": "npm --prefix server run seed",
+    "dev:server": "npm --prefix server run dev",
+    "dev:client": "npm --prefix client run dev",
+    "build": "npm --prefix client install --include=dev && npm --prefix client run build && npm --prefix server install",
+    "start": "npm --prefix server start",
+    "smoke": "npm --prefix server run smoke"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

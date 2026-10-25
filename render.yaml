@@ -1,0 +1,41 @@
+services:
+  - type: web
+    name: karyakshetram
+    runtime: node
+    plan: free
+    region: oregon
+    buildCommand: npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MONGO_URI
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_EXPIRES
+        value: 7d
+      - key: CORS_ORIGINS
+        value: "*"
+      - key: RATE_LIMIT_PER_MIN
+        value: 300
+      - key: LIVE_DATA
+        value: "on"
+      - key: LIVE_REFRESH_HOURS
+        value: 12
+      - key: GOOGLE_PLACES_KEY
+        value: AIzaSyByEueN4VbYQjtU-_VObrCMuQiovhmHWfk
+      - key: OCM_API_KEY
+        sync: false
+      - key: PLATFORM_FEED_URLS
+        sync: false
+      - key: MODEL_VERSION
+        value: rf-300-v1.0.0
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: LLM_API_KEY
+        sync: false
+      - key: VITE_GOOGLE_MAPS_KEY
+        value: AIzaSyC1FrQwnWsdmL9MTnVZ1x-MhcufYUDxLpU
