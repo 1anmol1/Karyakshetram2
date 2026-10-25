@@ -19,7 +19,7 @@ class Boundary extends React.Component {
 
 createRoot(document.getElementById('root')).render(
   <React.StrictMode>
-    <BrowserRouter>
+    <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
       <ThemeProvider><ToastProvider><AuthProvider><AppProvider><Boundary><App /></Boundary></AppProvider></AuthProvider></ToastProvider></ThemeProvider>
     </BrowserRouter>
   </React.StrictMode>,
