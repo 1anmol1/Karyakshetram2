@@ -67,7 +67,7 @@ export function ShopCard({ s, i, square, catInfo, saved, onSave, onClick }) {
       tabIndex={0}
       style={{ cursor: 'pointer' }}
     >
-      <div className="ph"><Photo category={s.category} seed={i + 3} h={square ? 150 : 120} />
+      <div className="ph"><Photo category={s.category} name={s.name} shopId={s.id || s._id || s.cell} seed={i} h={square ? 150 : 120} />
         <button className={`save ${saved ? 'on' : ''}`} onClick={(e) => { e.stopPropagation(); onSave?.(s); }} aria-label={saved ? 'Saved' : 'Save location'}><Icon n={saved ? 'bookmark-fill' : 'bookmark-line'} s={14} c={saved ? 'var(--accent)' : undefined} />{saved ? 'Saved' : 'Save'}</button>
       </div>
       <div className="pad12 col g6">

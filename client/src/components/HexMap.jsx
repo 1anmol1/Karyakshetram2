@@ -24,8 +24,7 @@ function finishGmapsLoad() {
 }
 
 function loadGmapsApi(cb) {
-  if (gmapsLoaded || (typeof window !== 'undefined' && window.google?.maps)) {
-    gmapsLoaded = true;
+  if (gmapsLoaded && typeof window !== 'undefined' && window.google?.maps?.Map) {
     cb();
     return;
   }
@@ -33,22 +32,28 @@ function loadGmapsApi(cb) {
   if (gmapsLoading) return;
   gmapsLoading = true;
   if (!GMAPS_KEY) {
-    // No key available — resolve immediately (will fallback to OSM)
+    // No key available — resolve immediately to use CARTO basemap
     finishGmapsLoad();
     return;
   }
-  window.__initGmapsApi = finishGmapsLoad;
+  window.__initGmapsApi = async () => {
+    try {
+      if (window.google?.maps?.importLibrary) {
+        await Promise.all([
+          google.maps.importLibrary('maps'),
+          google.maps.importLibrary('places'),
+        ]);
+      }
+    } catch (e) {
+      console.warn('Google Maps async importLibrary warning:', e);
+    }
+    finishGmapsLoad();
+  };
   const s = document.createElement('script');
   s.src = `https://maps.googleapis.com/maps/api/js?key=${GMAPS_KEY}&libraries=places&loading=async&callback=__initGmapsApi`;
   s.async = true;
   s.defer = true;
-  s.onload = () => {
-    if (window.google?.maps) {
-      finishGmapsLoad();
-    }
-  };
   s.onerror = () => {
-    // Fallback gracefully
     finishGmapsLoad();
   };
   document.head.appendChild(s);
@@ -113,8 +118,9 @@ export default function HexMap({ features, picks = [], own = [], comps = [], rin
     }).setView(center || [18.555, 73.85], zoom);
 
     let baseTile;
+    let isCarto = false;
 
-    if (GMAPS_KEY && window.google?.maps) {
+    if (GMAPS_KEY && window.google?.maps?.Map) {
       // Google Maps basemap — roadmap style, city context only
       try {
         baseTile = L.gridLayer.googleMutant({
@@ -134,15 +140,17 @@ export default function HexMap({ features, picks = [], own = [], comps = [], rin
         });
         baseTile.addTo(m);
       } catch (e) {
-        // Fallback to OSM if mutant fails
-        baseTile = _osmFallback(m, setOffline);
+        // Fallback to CARTO Positron / Dark Matter (no 403 blocks)
+        baseTile = _cartoFallback(m, theme, setOffline);
+        isCarto = true;
       }
     } else {
-      // No Google Maps key or API not loaded — fallback to OSM
-      baseTile = _osmFallback(m, setOffline);
+      // Use CARTO basemap (official, fast, free, no 403 access blocked errors)
+      baseTile = _cartoFallback(m, theme, setOffline);
+      isCarto = true;
     }
 
-    layers.current = { hex: L.layerGroup().addTo(m), marks: L.layerGroup().addTo(m), tiles: baseTile };
+    layers.current = { hex: L.layerGroup().addTo(m), marks: L.layerGroup().addTo(m), tiles: baseTile, isCarto };
     m.on('click', (e) => cbs.current.onMapClick?.({ lat: e.latlng.lat, lon: e.latlng.lng }));
     map.current = m;
 
@@ -152,6 +160,18 @@ export default function HexMap({ features, picks = [], own = [], comps = [], rin
   }, [gmReady]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => { if (center && map.current) map.current.setView(center, zoom ?? map.current.getZoom(), { animate: true }); }, [center?.[0], center?.[1], zoom]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Update CARTO basemap tiles when switching theme
+  useEffect(() => {
+    if (!map.current || !layers.current?.tiles) return;
+    if (layers.current.isCarto && layers.current.tiles.setUrl) {
+      const isDark = theme === 'dark' || (typeof document !== 'undefined' && document.documentElement.getAttribute('data-theme') === 'dark');
+      const newUrl = isDark
+        ? 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png'
+        : 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png';
+      layers.current.tiles.setUrl(newUrl);
+    }
+  }, [theme]);
 
   // hex layer
   useEffect(() => {
@@ -227,17 +247,26 @@ export default function HexMap({ features, picks = [], own = [], comps = [], rin
         </div>
       </div>}
       {offline && interactive && <span className="tag maptag" style={{ left: 14, top: 14, background: 'var(--bg)', height: 28 }}><Icon n="wifi-off-line" s={12} />Basemap offline · hex layer still shown</span>}
-      {interactive && <div className="attrib">© Google Maps · WorldPop</div>}
+      {interactive && <div className="attrib">© Google Maps · CARTO · WorldPop</div>}
     </div>
   );
 }
 
-// OSM fallback tile layer helper
-function _osmFallback(m, setOffline) {
-  const tiles = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 18, subdomains: 'abc', crossOrigin: true });
+// CARTO basemap helper — free high-performance vector-rendered tiles with zero 403 blocks
+function _cartoFallback(m, theme, setOffline) {
+  const isDark = theme === 'dark' || (typeof document !== 'undefined' && document.documentElement.getAttribute('data-theme') === 'dark');
+  const url = isDark
+    ? 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png'
+    : 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png';
+  const tiles = L.tileLayer(url, {
+    maxZoom: 20,
+    subdomains: 'abcd',
+    crossOrigin: true,
+    attribution: '&copy; <a href="https://carto.com/">CARTO</a> &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+  });
   let errs = 0;
-  tiles.on('tileerror', () => { errs++; if (errs > 3) setOffline(true); });
-  tiles.on('tileload', () => { errs = 0; setOffline(false); });
+  tiles.on('tileerror', () => { errs++; if (errs > 4) setOffline?.(true); });
+  tiles.on('tileload', () => { errs = 0; setOffline?.(false); });
   tiles.addTo(m);
   return tiles;
 }
